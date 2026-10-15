@@ -57,15 +57,23 @@ export function CopyButton({
   };
 
   const base =
-    "group relative inline-grid cursor-pointer select-none place-items-center whitespace-nowrap rounded-sm font-medium transition-transform duration-100 ease-out active:scale-[0.97]";
+    "group relative inline-grid cursor-pointer select-none place-items-center whitespace-nowrap rounded-full font-medium transition-transform duration-100 ease-out active:scale-[0.97]";
   const look =
     variant === "primary"
-      ? "h-11 px-5 text-sm bg-accent text-accent-fg hover:bg-accent-hover"
-      : "h-11 px-3 text-sm text-ink bg-subtle hover:bg-border sm:h-9";
+      ? "h-12 px-6 text-sm bg-accent text-accent-fg hover:bg-accent-hover"
+      : "h-11 px-3.5 text-sm text-ink bg-subtle hover:bg-border sm:h-9";
 
   return (
     <>
       <button type="button" onClick={copy} data-state={state} className={`${base} ${look} ${className}`}>
+        {/* A ring that spreads once from the button when the copy lands. */}
+        {variant === "primary" ? (
+          <span
+            key={state === "copied" ? "on" : "off"}
+            aria-hidden
+            className={`pointer-events-none absolute inset-0 rounded-full ring-2 ring-accent ${state === "copied" ? "copy-ring" : "opacity-0"}`}
+          />
+        ) : null}
         {/* Every label sits in the same grid cell; the invisible ones hold the widest width. */}
         {(Object.keys(labels) as State[]).map((key) => (
           <span
