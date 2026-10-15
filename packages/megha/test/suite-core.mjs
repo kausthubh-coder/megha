@@ -105,7 +105,8 @@ export async function run({ root, logins }) {
     saveHint(key, { backend: "codex", sessionId: "mg_1", cloudId: "task_e_1" });
     assert.equal(loadHint(key).cloudId, "task_e_1");
     assert.equal(hintKey("c:\\repo", "Bearer secret-token-123"), key, "cwd case does not matter on Windows");
-    assert.ok(!readFileSync(join(DATA_DIR, "sessions.json"), "utf8").includes("secret-token-123"));
+    const stored = readdirSync(join(DATA_DIR, "hints")).map((f) => readFileSync(join(DATA_DIR, "hints", f), "utf8")).join("\n");
+    assert.ok(stored.includes("task_e_1") && !stored.includes("secret-token-123"));
   });
 
   await test("setupCommandsFor picks the install command from the lockfile", () => {
@@ -191,14 +192,11 @@ export async function run({ root, logins }) {
     const files = [...readdirSync(join(here, "fixtures")).filter((f) => f.endsWith(".json")).map((f) => join(here, "fixtures", f)),
       ...readdirSync(here).filter((f) => f.endsWith(".jsonl")).map((f) => join(here, f))];
     assert.ok(files.length >= 1);
-    const bad = [/sk-ant-[a-z]{2,4}\d{2}-/, /eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}/, /"(?:access|refresh|id)_token"/, /"env_vars"\s*:\s*\{\s*"/, /"secrets"\s*:\s*\{\s*"/, /gh[pousr]_[A-Za-z0-9]{20,}/];
+    const bad = [/sk-ant-[a-z]{2,4}\d{2}-/, /eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}/, /"(?:access|refresh|id)_token"/, /"(?:access|refresh)Token"/, /"env_vars"\s*:\s*\{\s*"/, /"secrets"\s*:\s*\{\s*"/, /gh[pousr]_[A-Za-z0-9]{20,}/];
     for (const f of files) {
       const text = readFileSync(f, "utf8");
       for (const re of bad) assert.ok(!re.test(text), `${f} matches ${re}`);
     }
-    if (existsSync(join(DATA_DIR, "sessions.json"))) {
-      const store = readFileSync(join(DATA_DIR, "sessions.json"), "utf8");
-      assert.ok(!store.includes(logins.codexToken) && !store.includes(logins.claudeToken));
-    }
+    // Output, ACP traffic and persisted files of the whole run are checked by suite-secrecy.mjs, last.
   });
 }

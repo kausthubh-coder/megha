@@ -16,10 +16,49 @@
 // container can't reach, and some of it tells the agent to call t3_thread_read. Only the user's request
 // (plus history as plain context, and attachment contents) goes through.
 
-import { readFileSync, statSync } from "node:fs";
+import { openSync, readSync, fstatSync, closeSync, lstatSync, realpathSync, constants as fsConstants } from "node:fs";
+import { homedir } from "node:os";
+import { join, dirname, basename, resolve } from "node:path";
 
 export const CONTINUE_PROMPT = "Continue where you left off."; // apps/server/src/orchestration-v2/RestartContinuation.ts
 const MAX_INLINE_FILE_BYTES = 64 * 1024;
+
+// Attachment markers are plain prompt text, so anyone who can put text in a prompt (a pasted snippet,
+// a handoff, an ACP client) can write one. megha reads a marked file only when it sits directly in
+// T3's own attachment folder: <base>/userdata/attachments (or <base>/dev/attachments for a dev server),
+// base = T3CODE_HOME or ~/.t3 (t3/upstream apps/server/src/config.ts deriveServerPaths; attachments
+// are stored flat there, attachmentPaths.ts). MEGHA_T3_ATTACHMENTS_DIR adds one more folder.
+export function t3AttachmentDirs(env = process.env, home = homedir()) {
+  const bases = [env.T3CODE_HOME?.trim(), join(home, ".t3")].filter(Boolean);
+  const dirs = bases.flatMap((b) => [join(b, "userdata", "attachments"), join(b, "dev", "attachments")]);
+  if (env.MEGHA_T3_ATTACHMENTS_DIR?.trim()) dirs.unshift(env.MEGHA_T3_ATTACHMENTS_DIR.trim());
+  return [...new Set(dirs)];
+}
+
+// Names that are credentials wherever they appear, even inside the attachment folder.
+const CREDENTIAL_NAME = /^(?:\.env.*|auth\.json|\.credentials\.json|credentials(?:\.json)?|\.netrc|_netrc|\.git-credentials|\.npmrc|\.pypirc|id_(?:rsa|dsa|ecdsa|ed25519).*|.*\.pem|.*\.key)$/i;
+const CREDENTIAL_DIR = /[\\/](?:\.codex|\.claude|\.ssh|\.aws|\.gnupg|\.config[\\/]gh)(?:[\\/]|$)/i;
+const samePath = (a, b) => (process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b);
+
+// The real path of a marked file if megha may read it, else null: a regular file (not a link, one
+// name) directly inside a trusted folder, after resolving links on both sides.
+export function trustedAttachmentPath(path, dirs) {
+  try {
+    const abs = resolve(String(path));
+    if (CREDENTIAL_NAME.test(basename(abs)) || CREDENTIAL_DIR.test(abs)) return null;
+    const st = lstatSync(abs);
+    if (!st.isFile() || st.nlink > 1) return null;
+    const real = realpathSync.native(abs);
+    if (CREDENTIAL_NAME.test(basename(real)) || CREDENTIAL_DIR.test(real)) return null;
+    const parent = realpathSync.native(dirname(abs)); // a linked folder in between resolves elsewhere
+    for (const d of dirs ?? []) {
+      let rd;
+      try { rd = realpathSync.native(d); } catch { continue; }
+      if (samePath(parent, rd) && samePath(dirname(real), rd)) return real;
+    }
+    return null;
+  } catch { return null; }
+}
 const OUR_COMMANDS = new Set(["pr", "open", "apply", "status"]);
 
 // Remove <tag>...</tag> blocks (T3 never nests them).
@@ -75,8 +114,9 @@ function looksLikeText(buf) {
 }
 
 // `[Attached image "x.png" is saved at: C:\...]` lines. Images travel as image blocks, so their line is
-// dropped; small text files are inlined; anything else is named so the cloud knows it is missing.
-function resolveAttachments(text, { hasImages, readFile }) {
+// dropped; small text files from T3's attachment folder are inlined; anything else is named so the
+// cloud knows it is missing.
+function resolveAttachments(text, { hasImages, readFile, attachmentDirs }) {
   const notes = [];
   const out = text.replace(/^\[Attached (image|file) "([^"\n]*)" is saved at: ([^\n]+)\]$/gm, (_m, type, name, path) => {
     if (type === "image") {
@@ -84,7 +124,9 @@ function resolveAttachments(text, { hasImages, readFile }) {
       notes.push(name);
       return `[An image "${name}" was attached in T3 Code but could not be sent to the cloud.]`;
     }
-    const file = readFile(path);
+    const safe = trustedAttachmentPath(path, attachmentDirs);
+    if (!safe) return `[A file "${name}" was attached in T3 Code but megha only sends files from T3's attachment folder, so it was not sent.]`;
+    const file = readFile(safe);
     if (file === null) return `[A file "${name}" was attached in T3 Code but could not be read.]`;
     if (file.length > MAX_INLINE_FILE_BYTES || !looksLikeText(file)) {
       return `[A file "${name}" was attached in T3 Code but not sent: it is binary or over ${MAX_INLINE_FILE_BYTES / 1024} KB.]`;
@@ -94,13 +136,19 @@ function resolveAttachments(text, { hasImages, readFile }) {
   return { text: out.replace(/\n{3,}/g, "\n\n").trim(), unsentImages: notes };
 }
 
+// Reads at most MAX_INLINE_FILE_BYTES + 1 bytes of an already-checked path, re-checking through the
+// open handle (no following a link swapped in after the check, where the OS supports O_NOFOLLOW).
 function defaultReadFile(path) {
+  let fd;
   try {
-    const st = statSync(path);
-    if (!st.isFile()) return null;
-    if (st.size > MAX_INLINE_FILE_BYTES) return Buffer.alloc(MAX_INLINE_FILE_BYTES + 1);
-    return readFileSync(path);
-  } catch { return null; }
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.nlink > 1) return null;
+    const buf = Buffer.alloc(Math.min(st.size, MAX_INLINE_FILE_BYTES + 1));
+    let n = 0;
+    while (n < buf.length) { const r = readSync(fd, buf, n, buf.length - n, n); if (!r) break; n += r; }
+    return st.size > MAX_INLINE_FILE_BYTES ? Buffer.alloc(MAX_INLINE_FILE_BYTES + 1) : buf.subarray(0, n);
+  } catch { return null; } finally { if (fd !== undefined) closeSync(fd); }
 }
 
 /**
@@ -109,7 +157,7 @@ function defaultReadFile(path) {
  *   userText: the request alone (no history), handoff: cleaned history or null,
  *   isContinue, command: {name, args} for megha's own slash commands, planMode: true|false|null }
  */
-export function cleanPrompt(blocks, { readFile = defaultReadFile } = {}) {
+export function cleanPrompt(blocks, { readFile = defaultReadFile, attachmentDirs = t3AttachmentDirs() } = {}) {
   const texts = [];
   const images = [];
   for (const b of blocks ?? []) {
@@ -137,7 +185,7 @@ export function cleanPrompt(blocks, { readFile = defaultReadFile } = {}) {
     handoff = rewriteHandoffContext(split.context);
     userText = split.user;
   }
-  const att = resolveAttachments(userText, { hasImages: images.length > 0, readFile });
+  const att = resolveAttachments(userText, { hasImages: images.length > 0, readFile, attachmentDirs });
   userText = att.text;
   text = handoff
     ? `Earlier conversation from T3 Code (context only, not a new request):\n\n${handoff}\n\nUser message:\n${userText}`

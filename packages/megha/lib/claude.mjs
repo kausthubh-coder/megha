@@ -1,18 +1,23 @@
 // Claude Code on the web backend (api.anthropic.com /v1/sessions + /v1/code/sessions).
-// Endpoint and body shapes: docs/research-claude.md. Auth: ~/.claude/.credentials.json claudeAiOauth,
-// read fresh per request and never refreshed here (refresh tokens rotate).
+// Endpoint and body shapes: docs/research-claude.md. Auth: ~/.claude/.credentials.json claudeAiOauth
+// (macOS: the "Claude Code-credentials" Keychain item), read fresh per request and never refreshed
+// or written here (refresh tokens rotate).
 
 import { readFileSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import crypto from "node:crypto";
-import { log, sleep, sseFrames, tail, git, repoInfo, UserError, saveSessionRecord, allSessionRecords, cleanTerminal, cachedList, localChanges } from "./util.mjs";
+import {
+  log, sleep, sseFrames, tail, git, repoInfo, UserError, saveSessionRecord, allSessionRecords, cleanTerminal, cachedList, localChanges,
+  CloudError, operationLabel, parseJsonBody, throwIfCancelled, boundedSignal,
+} from "./util.mjs";
 import { diffToolCall, applyLocally, diffFiles } from "./diff.mjs";
 
 const BASE = (process.env.CLAUDE_CLOUD_BASE_URL || "https://api.anthropic.com").replace(/\/+$/, "");
 const CC_VERSION = "2.1.288";
 const BETA_CCR = "ccr-byoc-2025-07-29";
-const AUTH_HELP = "Run `claude auth status` (or any `claude` command) so Claude Code refreshes its login, then retry. megha never refreshes tokens itself.";
+const AUTH_HELP = "Start `claude` once (it renews an expired login) or sign in again with `claude` then /login, then retry. megha never refreshes tokens itself.";
 const MODES = [
   { value: "default", name: "Ask for permission" },
   { value: "acceptEdits", name: "Accept edits" },
@@ -28,12 +33,39 @@ export const FALLBACK_MODELS = [
 
 const claudeDir = () => process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
 
-export function readCredentials() {
-  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) return { token: process.env.CLAUDE_CODE_OAUTH_TOKEN, expiresAt: null, scopes: null };
-  const file = join(claudeDir(), ".credentials.json");
-  let j;
-  try { j = JSON.parse(readFileSync(file, "utf8")); } catch (e) {
-    throw new UserError(`Claude cloud: cannot read ${file} (${e.code ?? "parse error"}). Log in with \`claude auth login\` (claude.ai account).`);
+// The Keychain item Claude Code stores its login in on macOS (Claude Code 2.1.288 oee()): "Claude
+// Code-credentials", plus "-<first 8 hex of sha256(config dir)>" when CLAUDE_CONFIG_DIR (or
+// CLAUDE_SECURESTORAGE_CONFIG_DIR) moves the config away from ~/.claude.
+export function keychainService(env = process.env) {
+  const secure = env.CLAUDE_SECURESTORAGE_CONFIG_DIR;
+  const isDefault = secure !== undefined ? !secure : !env.CLAUDE_CONFIG_DIR;
+  if (isDefault) return "Claude Code-credentials";
+  const dir = (secure !== undefined ? secure : env.CLAUDE_CONFIG_DIR).normalize("NFC");
+  return `Claude Code-credentials-${crypto.createHash("sha256").update(dir).digest("hex").slice(0, 8)}`;
+}
+const runSecurity = (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+let keychainCache = null; // {service, at, value}: the default lookup is cached briefly, in memory only
+// Read-only: `security find-generic-password -w` prints the stored JSON; nothing is ever written back.
+function readKeychain(env, exec) {
+  const service = keychainService(env);
+  const cacheable = exec === runSecurity;
+  if (cacheable && keychainCache?.service === service && Date.now() - keychainCache.at < 30_000) return keychainCache.value;
+  let value = null;
+  try { value = JSON.parse(String(exec("security", ["find-generic-password", "-s", service, "-w"])).trim()); } catch { value = null; }
+  if (cacheable) keychainCache = { service, at: Date.now(), value };
+  return value;
+}
+
+export function readCredentials({ env = process.env, platform = process.platform, exec = runSecurity } = {}) {
+  if (env.CLAUDE_CODE_OAUTH_TOKEN) return { token: env.CLAUDE_CODE_OAUTH_TOKEN, expiresAt: null, scopes: null };
+  const file = join(env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), ".credentials.json");
+  let j = platform === "darwin" ? readKeychain(env, exec) : null;
+  if (!j?.claudeAiOauth) {
+    try { j = JSON.parse(readFileSync(file, "utf8")); } catch (e) {
+      throw new UserError(platform === "darwin"
+        ? `Claude cloud: no claude.ai login found in the macOS Keychain ("${keychainService(env)}") or ${file}. Log in with \`claude auth login\` (claude.ai account).`
+        : `Claude cloud: cannot read ${file} (${e.code ?? "parse error"}). Log in with \`claude auth login\` (claude.ai account).`);
+    }
   }
   const o = j.claudeAiOauth;
   if (!o?.accessToken) throw new UserError("Claude cloud sessions need a claude.ai login (`claude auth login`); API keys are not accepted.");
@@ -63,25 +95,51 @@ function headers(token, { org, beta, json = true, accept } = {}) {
   return h;
 }
 
-class ApiError extends Error { constructor(msg, status, body) { super(msg); this.status = status; this.body = body; } }
+const LABEL = "Claude cloud";
+const REQUEST_TIMEOUT_MS = 30_000;
+// Error types and reasons worth naming (research-claude.md §3, §8), with fixed guidance. Anything
+// else, and every error message and body, is left out: bodies can echo secrets.
+const KNOWN_ERRORS = {
+  github_repo_access_denied: "Claude's GitHub app can't reach this repo.",
+  environment_not_found: "That environment no longer exists; pick another in the Environment option.",
+  model_not_available_for_org: "That model is not available for your organization; pick another in the Model option.",
+  feature_disabled: "Claude Code on the web is turned off for this account or organization.",
+  bound_unattested: "This session is bound to another device and can't be driven from here.",
+  untrusted_device: "This session is bound to another device and can't be driven from here.",
+  rate_limit_error: "Rate limited; wait a moment and retry.",
+  overloaded_error: "Claude is overloaded; retry in a moment.",
+  not_found_error: "It was not found (deleted, or not visible to this account).",
+  permission_error: "This account is not allowed to do that.",
+};
+function knownError(json) {
+  for (const c of [json?.error?.reason, json?.error?.type]) {
+    if (typeof c === "string" && Object.hasOwn(KNOWN_ERRORS, c)) return { code: c, guidance: KNOWN_ERRORS[c] };
+  }
+  return {};
+}
+// A failed request as a CloudError. The raw reason is only tested (GitHub refusal -> bundle fallback),
+// never kept.
+function cloudError(operation, status, json) {
+  const err = new CloudError({ label: LABEL, operation, status, ...knownError(json) });
+  err.githubRefused = /github|repo_access/i.test(`${json?.error?.reason ?? ""} ${json?.error?.type ?? ""}`);
+  return err;
+}
 
-async function api(method, path, { body, query, beta, noOrg, signal } = {}) {
+// signal: cancel / turn-finished signal for reads. Mutations pass none (see prompt()).
+async function api(method, path, { body, query, beta, noOrg, signal, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
   const token = readToken();
   const org = noOrg ? undefined : await getOrg();
   const url = new URL(BASE + path);
   for (const [k, v] of Object.entries(query ?? {})) if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
-  const res = await fetch(url, { method, headers: headers(token, { org, beta }), body: body === undefined ? undefined : JSON.stringify(body), signal });
+  const operation = operationLabel(method, path);
+  const res = await fetch(url, { method, headers: headers(token, { org, beta }), body: body === undefined ? undefined : JSON.stringify(body), signal: boundedSignal(signal, timeoutMs) });
   const text = await res.text();
-  let json; try { json = JSON.parse(text); } catch {}
   if (res.status === 401) throw new UserError(`Claude cloud rejected the claude.ai token (401). ${AUTH_HELP}`);
-  if (!res.ok) {
-    const err = json?.error;
-    throw new ApiError(`Claude cloud ${method} ${path.replace(/\/(cse|session)_[A-Za-z0-9]+/, "/<id>")} failed: HTTP ${res.status} ${err?.reason ?? err?.type ?? ""} ${String(err?.message ?? text).slice(0, 300)}`.trim(), res.status, json);
-  }
-  return json ?? {};
+  if (!res.ok) { let json; try { json = JSON.parse(text); } catch {} throw cloudError(operation, res.status, json); }
+  return parseJsonBody(text, LABEL, operation);
 }
 
-async function uploadFile(data, filename) {
+async function uploadFile(data, filename, signal) {
   const token = readToken();
   const boundary = `----megha${crypto.randomUUID()}`;
   const body = Buffer.concat([
@@ -89,11 +147,39 @@ async function uploadFile(data, filename) {
     data,
     Buffer.from(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="purpose"\r\n\r\nuser_data\r\n--${boundary}--\r\n`),
   ]);
-  const res = await fetch(`${BASE}/v1/files`, { method: "POST", body,
+  const res = await fetch(`${BASE}/v1/files`, { method: "POST", body, signal: boundedSignal(signal, 5 * 60_000),
     headers: { ...headers(token, { json: false, beta: "files-api-2025-04-14,oauth-2025-04-20" }), "Content-Type": `multipart/form-data; boundary=${boundary}` } });
   const text = await res.text();
-  if (!res.ok) throw new Error(`Claude cloud bundle upload failed: HTTP ${res.status} ${text.slice(0, 300)}`);
-  return JSON.parse(text).id;
+  if (res.status === 401) throw new UserError(`Claude cloud rejected the claude.ai token (401). ${AUTH_HELP}`);
+  if (!res.ok) { let json; try { json = JSON.parse(text); } catch {} throw cloudError("bundle upload", res.status, json); }
+  const id = parseJsonBody(text, LABEL, "bundle upload").id;
+  if (!id) throw new CloudError({ label: LABEL, operation: "bundle upload", guidance: "The cloud returned no file id." });
+  return id;
+}
+
+// Claude Code's own bundle upload keeps uncommitted tracked changes under a ref private to that one
+// upload, refs/seed/<ms>-<16 hex>/stash, and renames it to refs/seed/stash inside the bundle header,
+// the name the cloud reads (Claude Code 2.1.288 z7t()/V7t, bundle@11013564). megha does the same, so
+// concurrent uploads from worktrees of one repo (which share refs) never see each other's ref, and a
+// refs/seed/stash of the user's is never touched. Bundle header: signature line, optional @capability
+// lines (v3), "-<sha> ..." prerequisites and "<sha> <ref>" lines, a blank line, then the pack.
+export function relabelBundle(buf, labels) {
+  let pos = 0;
+  const line = () => {
+    const nl = buf.indexOf(10, pos);
+    if (nl < 0) throw new Error("git bundle header is not terminated");
+    const s = buf.toString("latin1", pos, nl); pos = nl + 1; return s;
+  };
+  const out = [line()];
+  if (out[0] !== "# v2 git bundle" && out[0] !== "# v3 git bundle") throw new Error("not a v2 or v3 git bundle");
+  const applied = new Set();
+  for (let l = line(); l !== ""; l = line()) {
+    const sp = l.indexOf(" ");
+    const name = sp > 0 && !l.startsWith("-") && !l.startsWith("@") ? l.slice(sp + 1) : null;
+    if (name !== null && Object.hasOwn(labels, name)) { out.push(`${l.slice(0, sp)} ${labels[name]}`); applied.add(name); } else out.push(l);
+  }
+  if (applied.size !== Object.keys(labels).length) throw new Error("git bundle header is missing a ref to relabel");
+  return Buffer.concat([Buffer.from(`${out.join("\n")}\n\n`, "latin1"), buf.subarray(pos)]);
 }
 
 const unwrap = (j) => j?.response_shape ?? j?.session ?? j;
@@ -123,6 +209,16 @@ function sourceRepo(s) {
   const m = src?.url?.match(/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/);
   return m ? `${m[1]}/${m[2]}`.toLowerCase() : null;
 }
+// The GitHub repo a session works on: its source, else its outcome. null for bundle-seeded sessions,
+// which carry no repo identity in the cloud.
+function sessionRepo(s) {
+  const out = (s.config?.outcomes ?? s.session_context?.outcomes ?? []).find((o) => o.type === "git_repository")?.git_info?.repo;
+  return sourceRepo(s) ?? (typeof out === "string" ? out.toLowerCase() : null);
+}
+const fullName = (repo) => (repo?.github ? `${repo.github.owner}/${repo.github.name}`.toLowerCase() : null);
+const samePath = (a, b) => !!a && !!b && (process.platform === "win32" ? resolve(a).toLowerCase() === resolve(b).toLowerCase() : resolve(a) === resolve(b));
+// Shown when the container never comes up. last_init_error itself is server text and is never shown.
+const STARTUP_FAILED = "Claude could not start the cloud session's container; open the session on claude.ai to see why";
 
 export const compareUrl = (full, base, branch) => `https://github.com/${full}/compare/${enc(base)}...${enc(branch)}?expand=1`;
 
@@ -137,6 +233,13 @@ export class ClaudeBackend {
     { name: "status", description: "Show the cloud session's status" },
   ];
   #cache = new Map();
+
+  // statusPollMs: how often a running turn checks the session for startup failures; turnTimeoutMs:
+  // the hard limit for one turn; idleMs: reconnect a stream that sends no bytes (not even keepalives)
+  // for this long. Tests shorten them.
+  constructor({ statusPollMs = 15_000, turnTimeoutMs = 3 * 3600_000, idleMs = 120_000 } = {}) {
+    Object.assign(this, { statusPollMs, turnTimeoutMs, idleMs });
+  }
 
   checkAuth() { readCredentials(); }
   webUrl(id) { return `https://claude.ai/code/${id}`; }
@@ -156,7 +259,7 @@ export class ClaudeBackend {
   }
   #models() {
     return cachedList("models-claude", 10 * 60_000, async () =>
-      modelsFromResponse(await api("GET", "/v1/models", { query: { limit: 1000 }, noOrg: true, signal: AbortSignal.timeout(5000) })), FALLBACK_MODELS);
+      modelsFromResponse(await api("GET", "/v1/models", { query: { limit: 1000 }, noOrg: true, timeoutMs: 5000 })), FALLBACK_MODELS);
   }
 
   async prepare(session) {
@@ -201,28 +304,72 @@ export class ClaudeBackend {
     if ((id === "apply" || id === "localChanges") && !["off", "on"].includes(value)) throw new UserError(`Invalid value ${value}`);
     if (id === "model" && !/^[\w.:-]+$/.test(value)) throw new UserError(`Invalid model ${value}`);
     if (!["model", "environment", "mode", "apply", "localChanges"].includes(id)) throw new UserError(`Unknown config option ${id}`);
+    if (id === "environment") this.#checkEnvironment(session, value);
     session.config[id] = value;
   }
 
+  // Only environments this account listed (bridge environments excluded) can be picked.
+  #checkEnvironment(session, value) {
+    if (value === "none" || (session.envs ?? []).some((e) => e.id === value)) return;
+    throw new UserError(`Unknown Claude cloud environment ${String(value).slice(0, 80)}. Pick one from the Environment option.`);
+  }
+
+  // Throws unless the session (GET /v1/code/sessions/{id}) works on this folder's repo. A GitHub
+  // session names its repo; a bundle-seeded one names none, so it must be one megha made in this folder.
+  #checkSession(session, s) {
+    const full = fullName(session.repo);
+    const theirs = sessionRepo(s);
+    if (theirs) {
+      if (theirs !== full) throw new UserError(`This Claude cloud session belongs to ${theirs}, not ${full ?? "this folder's repo"}, so megha won't open or continue it here.`);
+    } else if (!allSessionRecords("claude").some((r) => r.cloudId === session.cloudId && samePath(r.cwd, session.cwd))) {
+      throw new UserError("megha can't tell which repository this Claude cloud session came from (it was seeded from a git bundle, not made by megha in this folder), so it won't open or continue it here.");
+    }
+    session.repoChecked = true;
+  }
+
+  // session/load and session/resume of a cloud id, and the first follow-up of a session megha did not
+  // create in this process: confirm the repo, and note the session's current startup error so only a
+  // new one fails the next turn.
+  async checkRepo(session, signal) {
+    session.repo ??= await repoInfo(session.cwd);
+    const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal }));
+    this.#checkSession(session, s);
+    session.lastInitError = s.external_metadata?.last_init_error ?? null;
+    return s;
+  }
+
+  async #interruptQuietly(session) {
+    try { await this.#interrupt(session); log("interrupt sent"); } catch (e) { log(`interrupt failed: ${e.message}`); }
+  }
+
   // ---------- prompt ----------
+  // Cancellation: every await before a create or follow-up POST takes io.signal, and the signal is
+  // checked right before each mutation (git refs, bundle upload, POSTs). A POST already sent is
+  // awaited, then its session is interrupted in the cloud.
   async prompt(session, input, io) {
+    const { signal } = io;
     let fromSeq = 0, userSeq = 0;
+    session.repo ??= await repoInfo(session.cwd);
     if (input.isContinue && session.cloudId) {
       const r = await this.#continueTurn(session, io);
       if (r) return r;
     }
     if (!session.cloudId) {
       await this.#create(session, input, io);
+      if (signal.aborted) { await this.#interruptQuietly(session); return "cancelled"; }
     } else {
+      if (!session.repoChecked) await this.checkRepo(session, signal);
       const events = [];
       if (session.sentMode !== session.config.mode) events.push({ payload: { type: "control_request", request_id: `set-mode-${crypto.randomUUID()}`, request: { subtype: "set_permission_mode", mode: session.config.mode }, uuid: crypto.randomUUID() } });
       if (session.sentModel !== session.config.model) events.push({ payload: { type: "control_request", request_id: `set-model-${crypto.randomUUID()}`, request: { subtype: "set_model", model: session.config.model }, uuid: crypto.randomUUID() } });
       events.push({ payload: { uuid: crypto.randomUUID(), session_id: session.cloudId, type: "user", parent_tool_use_id: null, message: { role: "user", content: userContent(input.text, input.images) } } });
-      const r = await api("POST", `/v1/code/sessions/${enc(session.cloudId)}/events`, { body: { events } });
+      throwIfCancelled(signal);
+      const r = await api("POST", `/v1/code/sessions/${enc(session.cloudId)}/events`, { body: { events }, timeoutMs: 60_000 });
       userSeq = Number(r.results?.at(-1)?.sequence_num ?? 0);
       fromSeq = session.lastSeq ?? 0;
       session.sentMode = session.config.mode;
       session.sentModel = session.config.model;
+      if (signal.aborted) { await this.#interruptQuietly(session); return "cancelled"; }
     }
     if (input.images.length) io.text(`Sent ${input.images.length} image${input.images.length === 1 ? "" : "s"} with the prompt.\n\n`);
     const result = await this.#streamTurn(session, io, fromSeq, userSeq);
@@ -231,7 +378,8 @@ export class ClaudeBackend {
 
   async #afterTurn(session, result, io) {
     saveSessionRecord(session);
-    if (result.status === "completed") await this.#finishDiff(session, io);
+    // After Stop nothing more happens locally: no branch fetch, no automatic apply.
+    if (result.status === "completed" && !io.signal.aborted) await this.#finishDiff(session, io);
     io.text(`\n\n[Open in Claude Code on the web](${session.webUrl})`);
     if (session.title) io.update({ sessionUpdate: "session_info_update", title: session.title, updatedAt: new Date().toISOString() });
     saveSessionRecord(session);
@@ -244,11 +392,12 @@ export class ClaudeBackend {
   // T3's automatic "Continue where you left off." after a restart: follow a turn that is still running,
   // or show the end of one that finished while megha wasn't attached. Otherwise a normal follow-up.
   async #continueTurn(session, io) {
-    const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`));
+    const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal: io.signal }));
+    this.#checkSession(session, s);
     session.webUrl ??= this.webUrl(session.cloudId);
     let pending = s.worker_status === "running" || s.worker_status === "requires_action";
     if (!pending) {
-      const j = await api("GET", `/v1/code/sessions/${enc(session.cloudId)}/events`, { query: { sort_order: "asc", cursor: session.lastSeq ?? 0, limit: 500 } });
+      const j = await api("GET", `/v1/code/sessions/${enc(session.cloudId)}/events`, { query: { sort_order: "asc", cursor: session.lastSeq ?? 0, limit: 500 }, signal: io.signal });
       pending = (j.data ?? []).some((row) => row.payload?.type === "result" && !row.payload.parent_tool_use_id && Number(row.sequence_num) > (session.lastSeq ?? 0));
       if (pending) io.text("The cloud turn finished while T3 Code was away. Its result:\n\n");
     }
@@ -257,28 +406,38 @@ export class ClaudeBackend {
     return this.#afterTurn(session, await this.#streamTurn(session, io, session.lastSeq ?? 0, 0), io);
   }
 
-  // A git bundle of HEAD (+ the current branch); with local changes, also `git stash create` under
-  // refs/seed/stash, the ref Claude Code's own bundle upload uses for uncommitted tracked changes.
-  async #bundle(session, repo, withLocal) {
+  // A git bundle of HEAD (+ the current branch); with local changes, also the `git stash create`
+  // commit, under a ref private to this upload that the bundle header then names refs/seed/stash (see
+  // relabelBundle). The private ref is created only if absent and deleted only while it still points
+  // at this upload's stash.
+  async #bundle(session, repo, withLocal, signal) {
     const file = join(tmpdir(), `megha-${crypto.randomBytes(4).toString("hex")}.bundle`);
     const refs = ["HEAD", ...(repo.branch ? [repo.branch] : [])];
-    let stashed = false;
+    let ownRef = null, stashSha = null;
     if (withLocal) {
-      const sha = (await git(session.cwd, ["stash", "create"])).stdout.trim();
-      if (sha && (await git(session.cwd, ["update-ref", "refs/seed/stash", sha])).code === 0) { refs.push("refs/seed/stash"); stashed = true; }
+      stashSha = (await git(session.cwd, ["stash", "create"])).stdout.trim();
+      if (stashSha) {
+        throwIfCancelled(signal);
+        const ref = `refs/seed/${Date.now()}-${crypto.randomBytes(8).toString("hex")}/stash`;
+        if ((await git(session.cwd, ["update-ref", ref, stashSha, ""])).code === 0) { ownRef = ref; refs.push(ref); }
+      }
     }
     let b;
     try { b = await git(session.cwd, ["bundle", "create", file, ...refs]); }
-    finally { if (stashed) await git(session.cwd, ["update-ref", "-d", "refs/seed/stash"]); }
-    if (b.code !== 0) throw new Error(`git bundle create failed: ${b.stderr.trim().slice(0, 300)}`);
-    const data = readFileSync(file); rmSync(file, { force: true });
+    finally { if (ownRef) await git(session.cwd, ["update-ref", "-d", ownRef, stashSha]); }
+    if (b.code !== 0) { rmSync(file, { force: true }); throw new Error(`git bundle create failed: ${b.stderr.trim().slice(0, 300)}`); }
+    let data = readFileSync(file); rmSync(file, { force: true });
+    if (ownRef) data = relabelBundle(data, { [ownRef]: "refs/seed/stash" });
     if (data.length > 100 * 1024 * 1024) throw new UserError("The repo bundle is over 100 MB, which Claude cloud sessions do not accept.");
-    return { fileId: await uploadFile(data, "_source_seed.bundle"), kb: (data.length / 1024).toFixed(0), stashed };
+    throwIfCancelled(signal);
+    return { fileId: await uploadFile(data, "_source_seed.bundle", signal), kb: (data.length / 1024).toFixed(0), stashed: !!ownRef };
   }
 
   async #create(session, input, io) {
+    const { signal } = io;
     const cfg = session.config;
     if (!cfg.environment || cfg.environment === "none") throw new UserError("No Claude Code cloud environment found. Open https://claude.ai/code once to create the default environment, then retry.");
+    this.#checkEnvironment(session, cfg.environment);
     const repo = session.repo ?? (session.repo = await repoInfo(session.cwd));
     if (!repo.isRepo) throw new UserError(`${session.cwd} is not a git repository, so there is nothing to send to Claude's cloud. Run \`git init\` and commit your files, then retry.`);
     const title = input.userText.split("\n")[0].slice(0, 75) || "megha task";
@@ -302,7 +461,8 @@ export class ClaudeBackend {
       const outcomeBranch = `claude/${slug}-${crypto.randomBytes(3).toString("hex")}`;
       const full = `${repo.github.owner}/${repo.github.name}`;
       try {
-        created = await api("POST", "/v1/sessions", { beta: BETA_CCR, body: { ...base, session_context: {
+        throwIfCancelled(signal);
+        created = await api("POST", "/v1/sessions", { beta: BETA_CCR, timeoutMs: 60_000, body: { ...base, session_context: {
           sources: [{ type: "git_repository", url: `https://github.com/${full}`, revision }],
           outcomes: [{ type: "git_repository", git_info: { type: "github", repo: full, branches: [outcomeBranch] } }], ...model } } });
         session.bundle = false;
@@ -310,15 +470,16 @@ export class ClaudeBackend {
         session.baseBranch = revision;
         session.baseSha = revision === repo.branch ? repo.branchSha : repo.defaultSha;
       } catch (e) {
-        const reason = e.body?.error?.reason ?? "";
-        if (!(e instanceof ApiError) || e.status !== 400 || !/github|repo_access/i.test(reason + e.message)) throw e;
-        log(`GitHub source refused (${reason || e.status}); falling back to a git bundle`);
+        if (!(e instanceof CloudError) || e.status !== 400 || !e.githubRefused) throw e;
+        log(`GitHub source refused (${e.code ?? e.status}); falling back to a git bundle`);
         refused = true;
       }
     }
     if (!created) {
-      const b = await this.#bundle(session, repo, sendLocal);
-      created = await api("POST", "/v1/sessions", { beta: BETA_CCR, body: { ...base, session_context: { sources: [], outcomes: [], seed_bundle_file_id: b.fileId, ...model } } });
+      throwIfCancelled(signal);
+      const b = await this.#bundle(session, repo, sendLocal, signal);
+      throwIfCancelled(signal);
+      created = await api("POST", "/v1/sessions", { beta: BETA_CCR, timeoutMs: 60_000, body: { ...base, session_context: { sources: [], outcomes: [], seed_bundle_file_id: b.fileId, ...model } } });
       session.bundle = true;
       const what = b.stashed ? "your local repo including uncommitted tracked changes" : "your committed work";
       const why = sendLocal ? "\"Send local changes\" is on, so the session was seeded from"
@@ -331,6 +492,8 @@ export class ClaudeBackend {
     session.webUrl = this.webUrl(session.cloudId);
     session.sentMode = cfg.mode;
     session.sentModel = cfg.model;
+    session.repoChecked = true; // made here, from this folder's repo
+    session.lastInitError = null; // a new session: any startup error is this turn's
     saveSessionRecord(session);
     log(`created session ${session.cloudId}${session.bundle ? " (bundle)" : ""} (model ${cfg.model})`);
   }
@@ -345,13 +508,39 @@ export class ClaudeBackend {
     let finished = null;
     const finish = (r) => { if (!finished) { finished = r; ac.abort(); } };
     let interruptSent = false;
+    const timers = [];
     const onAbort = async () => {
       if (interruptSent) return; interruptSent = true;
-      try { await this.#interrupt(session); log("interrupt sent"); } catch (e) { log(`interrupt failed: ${e.message}`); }
-      setTimeout(() => finish({ status: "cancelled" }), 30_000).unref();
+      await this.#interruptQuietly(session);
+      timers.push(setTimeout(() => finish({ status: "cancelled" }), 30_000).unref());
     };
     io.signal.addEventListener("abort", onAbort, { once: true });
     if (io.signal.aborted) onAbort();
+    // The turn's hard limit fires on its own timer: a stream busy with keepalives can't postpone it.
+    timers.push(setTimeout(() => finish({ status: "failed", error: `timed out after ${Math.round(this.turnTimeoutMs / 60_000)} min` }), this.turnTimeoutMs));
+    // A container that fails to start shows up only in the session's status (external_metadata
+    // .last_init_error, or status "failed"; research-claude.md §8), never as a stream event.
+    const statusPoller = (async () => {
+      while (!finished) {
+        await sleep(this.statusPollMs, ac.signal);
+        if (finished) return;
+        try {
+          const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal: ac.signal }));
+          const initError = s.external_metadata?.last_init_error || null;
+          if (session.lastInitError === undefined) { session.lastInitError = initError; continue; } // no baseline yet
+          if (s.status === "failed" || (initError && initError !== session.lastInitError)) {
+            session.lastInitError = initError;
+            log("the cloud session failed to start");
+            finish({ status: "failed", error: STARTUP_FAILED });
+            return;
+          }
+        } catch (e) {
+          if (finished) return;
+          if (e instanceof UserError) { finish({ status: "failed", error: e.message }); return; }
+          log(`status check failed: ${e.message}`);
+        }
+      }
+    })();
 
     st.onPermission = async (row) => {
       const req = row.payload.request ?? {};
@@ -371,15 +560,21 @@ export class ClaudeBackend {
     };
 
     let lastSeq = fromSeq;
-    const deadline = Date.now() + 3 * 3600_000;
-    while (!finished && Date.now() < deadline) {
+    while (!finished) {
+      // Per connection: bounded until headers arrive, then aborted if no bytes (not even a keepalive)
+      // come for idleMs, so a dead connection reconnects instead of hanging.
+      const conn = new AbortController();
+      let idle = null;
+      const bump = () => { clearTimeout(idle); idle = setTimeout(() => conn.abort(), this.idleMs); };
       try {
         const token = readToken();
         const url = `${BASE}/v1/code/sessions/${enc(session.cloudId)}/events/stream?from_sequence_num=${lastSeq}`;
-        const res = await fetch(url, { headers: { ...headers(token, { json: false, accept: "text/event-stream" }), ...(lastSeq ? { "Last-Event-ID": String(lastSeq) } : {}) }, signal: ac.signal });
+        bump();
+        const res = await fetch(url, { headers: { ...headers(token, { json: false, accept: "text/event-stream" }), ...(lastSeq ? { "Last-Event-ID": String(lastSeq) } : {}) },
+          signal: AbortSignal.any([ac.signal, conn.signal]) });
         if (res.status === 401) throw new UserError(`Claude cloud rejected the claude.ai token (401). ${AUTH_HELP}`);
-        if (!res.ok) throw new Error(`stream HTTP ${res.status}`);
-        for await (const frame of sseFrames(res)) {
+        if (!res.ok) { await res.body?.cancel().catch(() => {}); throw new CloudError({ label: LABEL, operation: "stream", status: res.status }); }
+        for await (const frame of sseFrames(res, { onActivity: bump })) {
           if (frame.event !== "client_event") continue;
           let row; try { row = JSON.parse(frame.data); } catch { continue; }
           const seq = Number(row.sequence_num ?? frame.id ?? 0);
@@ -391,14 +586,16 @@ export class ClaudeBackend {
       } catch (e) {
         if (finished || ac.signal.aborted) break;
         if (e instanceof UserError) { finish({ status: "failed", error: e.message }); break; }
-        log(`stream error (${e.message}); reconnecting`);
-      }
+        log(`stream error (${conn.signal.aborted ? "no data" : e.message}); reconnecting`);
+      } finally { clearTimeout(idle); }
       if (!finished) await sleep(1500, ac.signal);
     }
+    await statusPoller;
+    for (const t of timers) clearTimeout(t);
     io.signal.removeEventListener("abort", onAbort);
     st.closeSetup();
     try {
-      const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`));
+      const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal: io.signal }));
       session.title = s.title ?? session.title;
     } catch {}
     const status = io.signal.aborted && finished?.status !== "completed" ? "cancelled" : finished?.status ?? "failed";
@@ -407,14 +604,36 @@ export class ClaudeBackend {
   }
 
   // The session's pushed outcome branch, fetched as origin/<branch>, and its diff from the base.
-  async #branchDiff(session) {
-    if (session.bundle || !session.outcomeBranch || !session.baseSha) return { reason: session.bundle ? "bundle" : "none" };
-    const ls = await git(session.cwd, ["ls-remote", "origin", `refs/heads/${session.outcomeBranch}`]);
+  // A session megha created knows its base commit. An imported one (made on claude.ai, or its local
+  // record is gone) doesn't: its base is where the outcome branch left the branch it started from.
+  async #branchDiff(session, signal) {
+    if (session.bundle || !session.outcomeBranch) return { reason: session.bundle ? "bundle" : "none" };
+    const cwd = session.cwd;
+    const outcome = `refs/remotes/origin/${session.outcomeBranch}`;
+    const ls = await git(cwd, ["ls-remote", "origin", `refs/heads/${session.outcomeBranch}`]);
     if (ls.code !== 0 || !ls.stdout.trim()) return { reason: "not-pushed" };
-    const f = await git(session.cwd, ["fetch", "--no-tags", "origin", `${session.outcomeBranch}:refs/remotes/origin/${session.outcomeBranch}`]);
+    throwIfCancelled(signal);
+    const f = await git(cwd, ["fetch", "--no-tags", "origin", `${session.outcomeBranch}:${outcome}`]);
     if (f.code !== 0) return { reason: "fetch", detail: f.stderr.trim().slice(0, 200) };
-    const d = await git(session.cwd, ["diff", "--no-color", session.baseSha, `refs/remotes/origin/${session.outcomeBranch}`]);
+    let base = session.baseSha;
+    if (base && (await git(cwd, ["cat-file", "-e", `${base}^{commit}`])).code !== 0) base = null;
+    if (!base) {
+      const from = session.baseBranch ?? session.repo?.defaultBranch;
+      if (!from) return { reason: "no-base" };
+      throwIfCancelled(signal);
+      const fb = await git(cwd, ["fetch", "--no-tags", "origin", `+${from}:refs/remotes/origin/${from}`]);
+      const mb = fb.code === 0 ? await git(cwd, ["merge-base", `refs/remotes/origin/${from}`, outcome]) : null;
+      if (!mb || mb.code !== 0 || !/^[0-9a-f]{40}$/.test(mb.stdout.trim())) return { reason: "no-base", from };
+      base = mb.stdout.trim();
+      session.baseSha = base;
+      session.baseBranch ??= from;
+      log(`recovered the session's base from origin/${from}`);
+    }
+    const d = await git(cwd, ["diff", "--no-color", base, outcome]);
     return { diff: d.code === 0 ? d.stdout : "" };
+  }
+  #noBaseText(session, r) {
+    return `The session pushed \`${session.outcomeBranch}\`, but megha could not work out which commit it started from${r.from ? ` (\`${session.outcomeBranch}\` shares no history with origin/${r.from})` : ""}, so it can't build the diff. Compare the branch on GitHub instead.`;
   }
 
   #compare(session) {
@@ -424,13 +643,15 @@ export class ClaudeBackend {
 
   // Only GitHub-sourced sessions push an outcome branch; bundle-seeded ones have no way back.
   async #finishDiff(session, io) {
-    const r = await this.#branchDiff(session);
+    const r = await this.#branchDiff(session, io.signal);
     if (r.reason === "fetch") { io.text(`\n\nCould not fetch ${session.outcomeBranch}: ${r.detail}`); return; }
+    if (r.reason === "no-base") { io.text(`\n\n${this.#noBaseText(session, r)}`); return; }
     const diff = r.diff;
-    if (!diff?.trim()) return;
+    if (!diff?.trim() || io.signal.aborted) return;
     io.update(diffToolCall({ toolCallId: `diff:${session.cloudId}:${session.lastSeq}`, diff, cwd: session.cwd, title: `Branch ${session.outcomeBranch}: ${diffFiles(diff).length} files` }));
     const compare = this.#compare(session);
     if (session.config.apply === "on") {
+      throwIfCancelled(io.signal);
       const a = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${session.lastSeq}`, previousFile: session.appliedPatchFile });
       if (a.ok && !a.unchanged) session.appliedPatchFile = a.patchFile;
       io.text(`\n\n${a.message}`);
@@ -444,9 +665,11 @@ export class ClaudeBackend {
   async command(session, { name }, io) {
     if (name === "open") { io.text(session.webUrl ? `[Open in Claude Code on the web](${session.webUrl})` : "No cloud session yet: send a prompt first."); return; }
     if (!session.cloudId) { io.text("No cloud session yet: send a prompt first."); return; }
+    session.repo ??= await repoInfo(session.cwd);
     switch (name) {
       case "status": {
-        const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`));
+        const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal: io.signal }));
+        this.#checkSession(session, s);
         io.text([`**${s.title ?? session.title ?? "Cloud session"}**`, `Status: ${s.worker_status ?? s.status ?? "unknown"}`,
           `Model: ${s.config?.model ?? session.config.model}`, `Permission mode: ${s.config?.permission_mode ?? session.config.mode}`,
           session.bundle ? "Source: git bundle (can't push a branch)" : `Branch: ${session.outcomeBranch ?? "?"}`,
@@ -454,9 +677,12 @@ export class ClaudeBackend {
         return;
       }
       case "apply": {
-        const r = await this.#branchDiff(session);
+        if (!session.repoChecked) await this.checkRepo(session, io.signal);
+        const r = await this.#branchDiff(session, io.signal);
         if (r.reason === "bundle") { io.text("This session was seeded from a git bundle, so it can't push a branch to apply. Open it on claude.ai to see its changes."); return; }
+        if (r.reason === "no-base") { io.text(this.#noBaseText(session, r)); return; }
         if (!r.diff?.trim()) { io.text(r.reason === "fetch" ? `Could not fetch ${session.outcomeBranch}: ${r.detail}` : `The session hasn't pushed \`${session.outcomeBranch ?? "a branch"}\` yet.`); return; }
+        throwIfCancelled(io.signal);
         const a = await applyLocally({ cwd: session.cwd, diff: r.diff, name: `${session.cloudId}-${session.lastSeq}`, previousFile: session.appliedPatchFile });
         if (a.ok && !a.unchanged) session.appliedPatchFile = a.patchFile;
         saveSessionRecord(session);
@@ -465,6 +691,7 @@ export class ClaudeBackend {
       }
       case "pr": {
         if (session.bundle) { io.text("This session was seeded from a git bundle, so it can't push a branch for a pull request."); return; }
+        if (!session.repoChecked) await this.checkRepo(session, io.signal);
         const ls = session.outcomeBranch ? await git(session.cwd, ["ls-remote", "origin", `refs/heads/${session.outcomeBranch}`]) : null;
         if (!ls?.stdout.trim()) { io.text(`The session hasn't pushed \`${session.outcomeBranch ?? "a branch"}\` yet. Ask it to commit and push, then try /pr again.`); return; }
         io.text(`[Open a pull request for \`${session.outcomeBranch}\`](${this.#compare(session)})`);
@@ -478,23 +705,32 @@ export class ClaudeBackend {
   async list(cwd, cursor) {
     const repo = await repoInfo(cwd);
     const full = repo.github ? `${repo.github.owner}/${repo.github.name}`.toLowerCase() : null;
-    const mine = new Set(allSessionRecords("claude").filter((r) => r.cwd?.toLowerCase() === cwd.toLowerCase()).map((r) => r.cloudId));
+    const mine = new Set(allSessionRecords("claude").filter((r) => samePath(r.cwd, cwd)).map((r) => r.cloudId));
     const j = await api("GET", "/v1/code/sessions", { query: { limit: 50, cursor } });
+    // A session that names a repo must name this one; one that names none (bundle-seeded) must be
+    // one megha made in this folder.
     const sessions = (j.data ?? [])
       .filter((s) => s.status !== "archived" && s.environment_kind !== "bridge")
-      .filter((s) => mine.has(s.id) || (full && sourceRepo(s) === full))
+      .filter((s) => { const theirs = sessionRepo(s); return theirs ? !!full && theirs === full : mine.has(s.id); })
       .map((s) => ({ sessionId: s.id, cwd, title: s.title ?? null, updatedAt: s.last_event_at ?? s.updated_at ?? s.created_at ?? null,
         _meta: { status: s.worker_status ?? s.status ?? null } }));
     return { sessions, ...(j.next_cursor ? { nextCursor: j.next_cursor } : {}) };
   }
 
   async replay(session, io) {
-    const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`));
+    const s = await this.checkRepo(session);
     session.title = s.title ?? session.title;
     session.webUrl = this.webUrl(session.cloudId);
     const outcome = (s.config?.outcomes ?? []).find((o) => o.type === "git_repository");
     session.outcomeBranch ??= outcome?.git_info?.branches?.[0];
     session.bundle ??= !(s.config?.sources ?? []).length;
+    // Where an imported GitHub session started: its source revision (a commit, or a branch), else the
+    // repo's default branch (web-created sources carry no revision). #branchDiff resolves the commit.
+    if (!session.bundle && !session.baseSha) {
+      const rev = (s.config?.sources ?? []).find((x) => x.type === "git_repository")?.revision;
+      if (typeof rev === "string" && /^[0-9a-f]{40}$/i.test(rev)) session.baseSha = rev.toLowerCase();
+      else session.baseBranch ??= (typeof rev === "string" && rev) || session.repo?.defaultBranch || null;
+    }
     const rows = [];
     let cursor;
     for (let i = 0; i < 100; i++) {

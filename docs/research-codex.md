@@ -125,3 +125,6 @@ No cancel/archive/follow-up anywhere in codex-rs.
 - Repo search: `GET /wham/github/repositories/search/all-installations?query&limit&page&connector_id` → `{repositories:[{id:"github-<n>", repository_full_name, default_branch, visibility, permissions}]}`.
 - PR from a turn: `POST /wham/tasks/{id}/turns/{turn}/pr` with `{}` or `{mode:"draft"}`.
 - Images: uploaded through `/backend-api/files` the same way the desktop app does, then referenced from `input_items` (see packages/megha/lib/image.mjs).
+- Task details carry `current_assistant_turn.environment_id` and the full `environment` (with `repo_map`); megha uses
+  them to confirm a task belongs to the current repo before list/load/follow-up.
+- `codex login status` only reads the stored login; the CLI refreshes when it next calls OpenAI.

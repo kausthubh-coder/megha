@@ -3,7 +3,7 @@
 
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, copyFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -21,55 +21,147 @@ export const sleep = (ms, signal) => new Promise((resolve) => {
 
 export class UserError extends Error {}
 
+// ---------- cloud API errors ----------
+// A failed cloud request. The message is built only from the HTTP status, a fixed operation label and
+// an allowlisted error code, never from the response body: error bodies can echo env vars, tokens or
+// account ids, and this message goes to stderr and into the ACP error T3 shows.
+export class CloudError extends Error {
+  constructor({ label, operation, status = null, code = null, guidance = null }) {
+    super(`${label} ${operation} failed${status ? `: HTTP ${status}` : ""}${code ? ` (${code})` : ""}. ${guidance ?? statusGuidance(status)}`.trim());
+    this.status = status;
+    this.code = code;
+  }
+}
+function statusGuidance(status) {
+  if (status === 403) return "Access was denied for this account.";
+  if (status === 404) return "It was not found (deleted, or not visible to this account).";
+  if (status === 409) return "The cloud reported a conflict; retry in a moment.";
+  if (status === 413) return "The upload is too large.";
+  if (status === 429) return "Rate limited; wait a moment and retry.";
+  if (status >= 500) return "The cloud had a server error; retry in a moment.";
+  if (status >= 400) return "The cloud rejected the request.";
+  return "";
+}
+// "GET /wham/tasks/task_e_1?x=y" -> "GET /wham/tasks/<id>": ids and query strings stay out of messages.
+const isIdSegment = (p) => !/^v\d+$/.test(p) && (/[\d~%]/.test(p) || /^(?:task|cse|session|file|env|assttrn|usertrn)_/.test(p) || p.length > 40);
+export function operationLabel(method, path) {
+  const segs = String(path).split("?")[0].split("/").map((p) => (p && isIdSegment(p) ? "<id>" : p));
+  return `${method} ${segs.join("/")}`;
+}
+// Parse a JSON response body without letting the body reach an error message (SyntaxError messages
+// quote the input).
+export function parseJsonBody(text, label, operation) {
+  if (!text) return {};
+  try { return JSON.parse(text); } catch { throw new CloudError({ label, operation, guidance: "The cloud sent a response megha could not read." }); }
+}
+
+// ---------- cancellation and request bounds ----------
+export class Cancelled extends Error { constructor() { super("cancelled"); this.name = "Cancelled"; } }
+// Call before every cloud or local mutation: a cancelled turn must not start new work.
+export function throwIfCancelled(signal) { if (signal?.aborted) throw new Cancelled(); }
+// The caller's signal (cancel, or the turn finished) plus a per-request timeout, so no request can
+// hang a turn.
+export function boundedSignal(signal, timeoutMs) {
+  const t = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, t]) : t;
+}
+
 // ---------- data dir: %LOCALAPPDATA%\megha (ids, settings and caches only, no secrets) ----------
 const appData = () => process.env.LOCALAPPDATA || join(homedir(), ".local", "share");
 // MEGHA_DATA_DIR lets tests use a throwaway folder.
 export const DATA_DIR = process.env.MEGHA_DATA_DIR || join(appData(), "megha");
-const storeFile = join(DATA_DIR, "sessions.json");
-const LEGACY_STORE = join(appData(), "cloud-acp", "sessions.json");
+// Session records and thread hints live one file each (sessions/<id>.json, hints/<key>.json). T3 runs
+// one megha process per thread, and a single shared file lost updates when two processes read, changed
+// and replaced it at the same time. One file per record has one writer and needs no lock.
+const SESSIONS_DIR = join(DATA_DIR, "sessions");
+const HINTS_DIR = join(DATA_DIR, "hints");
+const OLD_STORE = join(DATA_DIR, "sessions.json"); // megha 0.1.0
+const LEGACY_STORE = join(appData(), "cloud-acp", "sessions.json"); // megha was called cloud-acp
+const MAX_SESSIONS = 500;
+const MAX_HINTS = 200;
 
-// megha was called cloud-acp; carry its session map over once so imported threads keep working.
-export function migrateLegacyStore({ from = LEGACY_STORE } = {}) {
-  if (existsSync(storeFile) || !existsSync(from)) return false;
-  mkdirSync(DATA_DIR, { recursive: true });
-  copyFileSync(from, storeFile);
-  log(`migrated sessions from ${from}`);
-  return true;
+// Ids come from the client (session/load can name any cloud id), so map them to safe file names.
+function fileFor(dir, id) {
+  const s = String(id);
+  return join(dir, `${/^[A-Za-z0-9_-]{1,128}$/.test(s) ? s : `h_${crypto.createHash("sha256").update(s).digest("hex").slice(0, 40)}`}.json`);
 }
 
-function readStore() {
-  try {
-    const s = JSON.parse(readFileSync(storeFile, "utf8"));
-    return { sessions: s.sessions ?? {}, hints: s.hints ?? {} };
-  } catch { return { sessions: {}, hints: {} }; }
+// Write via a temp file + rename so readers never see half a record. Windows refuses a rename onto a
+// file another process is renaming or reading at that instant (EPERM/EBUSY): retry briefly.
+function writeJsonAtomic(dir, file, value) {
+  mkdirSync(dir, { recursive: true });
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  writeFileSync(tmp, JSON.stringify(value, null, 2));
+  for (let i = 0; ; i++) {
+    try { renameSync(tmp, file); return; } catch (e) {
+      if (!["EPERM", "EBUSY", "EACCES"].includes(e.code) || i >= 50) { rmSync(tmp, { force: true }); throw e; }
+      const until = Date.now() + 5 + i * 2;
+      while (Date.now() < until) { /* these races clear within milliseconds */ }
+    }
+  }
 }
-function writeStore(store) {
-  mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = `${storeFile}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(store, null, 2));
-  renameSync(tmp, storeFile);
+// null when missing. A record that can't be read is skipped and logged; it never turns into "no
+// records", so nothing else is lost because of it.
+const reportedUnreadable = new Set();
+function readJson(file) {
+  try { return JSON.parse(readFileSync(file, "utf8")); } catch (e) {
+    if (e.code !== "ENOENT" && !reportedUnreadable.has(file)) { reportedUnreadable.add(file); log(`skipping an unreadable record (${e.code ?? "parse error"})`); }
+    return null;
+  }
 }
+function jsonFiles(dir) {
+  try { return readdirSync(dir).filter((n) => n.endsWith(".json")); } catch { return []; }
+}
+const readAll = (dir) => jsonFiles(dir).map((n) => readJson(join(dir, n))).filter(Boolean);
+// Keep the folder small: drop the oldest files past the cap (by modification time).
+function prune(dir, max) {
+  const names = jsonFiles(dir);
+  if (names.length <= max + 20) return;
+  const aged = names.map((n) => { try { return [n, statSync(join(dir, n)).mtimeMs]; } catch { return [n, 0]; } }).sort((a, b) => b[1] - a[1]);
+  for (const [n] of aged.slice(max)) rmSync(join(dir, n), { force: true });
+}
+
+// Import the records of a single-file store (megha 0.1.0, or cloud-acp) once, without overwriting
+// anything already stored. A marker file makes later runs a no-op.
+export function migrateLegacyStore({ from } = {}) {
+  let imported = false;
+  for (const file of from ? [from] : [OLD_STORE, LEGACY_STORE]) {
+    const marker = join(SESSIONS_DIR, `.imported-${crypto.createHash("sha256").update(file.toLowerCase()).digest("hex").slice(0, 16)}`);
+    if (existsSync(marker) || !existsSync(file)) continue;
+    const old = readJson(file);
+    if (!old) continue;
+    for (const rec of Object.values(old.sessions ?? {})) {
+      if (rec?.id && !existsSync(fileFor(SESSIONS_DIR, rec.id))) writeJsonAtomic(SESSIONS_DIR, fileFor(SESSIONS_DIR, rec.id), rec);
+    }
+    for (const [key, h] of Object.entries(old.hints ?? {})) {
+      if (!existsSync(fileFor(HINTS_DIR, key))) writeJsonAtomic(HINTS_DIR, fileFor(HINTS_DIR, key), { ...h, key });
+    }
+    mkdirSync(SESSIONS_DIR, { recursive: true });
+    writeFileSync(marker, new Date().toISOString());
+    log(`migrated sessions from ${file}`);
+    imported = true;
+  }
+  return imported;
+}
+
 export function loadSessionRecord(id) {
-  return readStore().sessions[id] ?? null;
+  const rec = readJson(fileFor(SESSIONS_DIR, id));
+  return rec && rec.id === id ? rec : null;
 }
 export function findSessionByCloudId(backend, cloudId) {
-  return Object.values(readStore().sessions).find((s) => s.backend === backend && s.cloudId === cloudId) ?? null;
+  return readAll(SESSIONS_DIR).find((s) => s.backend === backend && s.cloudId === cloudId) ?? null;
 }
 export function allSessionRecords(backend) {
-  return Object.values(readStore().sessions).filter((s) => s.backend === backend);
+  return readAll(SESSIONS_DIR).filter((s) => s.backend === backend);
 }
 const PERSISTED_KEYS = ["id", "backend", "cwd", "cloudId", "turnId", "doneTurnId", "lastSeq", "title", "webUrl", "config", "bundle",
   "outcomeBranch", "baseBranch", "baseSha", "appliedPatchFile", "sentMode", "sentModel", "prUrl", "createdAt", "updatedAt"];
 export function saveSessionRecord(session) {
-  const store = readStore();
   const rec = {};
   for (const k of PERSISTED_KEYS) if (session[k] !== undefined) rec[k] = session[k];
   rec.updatedAt = new Date().toISOString();
-  store.sessions[session.id] = rec;
-  // Keep the file small: drop the oldest records past 500.
-  const entries = Object.entries(store.sessions).sort((a, b) => (b[1].updatedAt ?? "").localeCompare(a[1].updatedAt ?? ""));
-  store.sessions = Object.fromEntries(entries.slice(0, 500));
-  writeStore(store);
+  writeJsonAtomic(SESSIONS_DIR, fileFor(SESSIONS_DIR, session.id), rec);
+  prune(SESSIONS_DIR, MAX_SESSIONS);
 }
 
 // Thread hints: T3 replaces the ACP session on rollback (provider-acp adapter rollbackThread) and gives
@@ -77,15 +169,12 @@ export function saveSessionRecord(session) {
 // the credential) maps a fresh session back to the cloud task the thread was using.
 export const hintKey = (cwd, secret) => crypto.createHash("sha256").update(`${String(cwd).toLowerCase()}\n${secret}`).digest("hex").slice(0, 32);
 export function saveHint(key, value) {
-  const store = readStore();
-  store.hints[key] = { ...value, at: new Date().toISOString() };
-  const entries = Object.entries(store.hints).sort((a, b) => (b[1].at ?? "").localeCompare(a[1].at ?? ""));
-  store.hints = Object.fromEntries(entries.slice(0, 200));
-  writeStore(store);
+  writeJsonAtomic(HINTS_DIR, fileFor(HINTS_DIR, key), { ...value, key, at: new Date().toISOString() });
+  prune(HINTS_DIR, MAX_HINTS);
 }
 export function loadHint(key, maxAgeMs = 7 * 24 * 3600_000) {
-  const h = readStore().hints[key];
-  if (!h || Date.now() - Date.parse(h.at ?? 0) > maxAgeMs) return null;
+  const h = readJson(fileFor(HINTS_DIR, key));
+  if (!h || h.key !== key || Date.now() - Date.parse(h.at ?? 0) > maxAgeMs) return null;
   return h;
 }
 
@@ -147,7 +236,8 @@ export async function repoInfo(cwd) {
   // One round of independent git calls: each spawn costs ~0.2 s on Windows (more on OneDrive).
   const [top, origin, cur, head, refs] = await Promise.all([
     git(cwd, ["rev-parse", "--show-toplevel"]),
-    git(cwd, ["remote", "get-url", "origin"]),
+    // The configured URL names the repo; `remote get-url` would apply url.*.insteadOf rewrites.
+    git(cwd, ["config", "--get", "remote.origin.url"]),
     git(cwd, ["branch", "--show-current"]),
     git(cwd, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]),
     git(cwd, ["for-each-ref", "--format=%(objectname) %(refname)", "refs/remotes/origin/"]),
@@ -210,29 +300,52 @@ export function setupCommandsFor(root, exists = existsSync) {
 }
 
 // ---------- SSE ----------
-// Yields {event, id, data} frames from a fetch Response body.
-export async function* sseFrames(res) {
+// Yields {event, id, data} frames from a fetch Response body, by the event-stream rules: lines end in
+// LF, CRLF or a lone CR, and a blank line ends a frame. A CRLF can be split across network chunks, so a
+// CR at the very end of the buffer waits for the next chunk before it counts as a line end.
+// onActivity fires for every chunk (keepalive comments included) so callers can spot a dead connection.
+export async function* sseFrames(res, { onActivity } = {}) {
   const dec = new TextDecoder();
   let buf = "";
-  for await (const chunk of res.body) {
-    buf += dec.decode(chunk, { stream: true }).replace(/\r\n/g, "\n");
-    let k;
-    while ((k = buf.indexOf("\n\n")) >= 0) {
-      const raw = buf.slice(0, k); buf = buf.slice(k + 2);
-      let event = "message", id, data = [];
-      for (const line of raw.split("\n")) {
-        if (line.startsWith(":")) continue;
-        const i = line.indexOf(":");
-        const field = i < 0 ? line : line.slice(0, i);
-        let value = i < 0 ? "" : line.slice(i + 1);
-        if (value.startsWith(" ")) value = value.slice(1);
-        if (field === "event") event = value;
-        else if (field === "id") id = value;
-        else if (field === "data") data.push(value);
-      }
-      if (data.length) yield { event, id, data: data.join("\n") };
+  let started = false;
+  let event = "", id, data = [];
+  // Complete lines in buf; `final` means no more bytes are coming.
+  function* lines(final) {
+    for (;;) {
+      const i = buf.search(/[\r\n]/);
+      if (i < 0) return;
+      if (buf[i] === "\r" && i === buf.length - 1 && !final) return;
+      const line = buf.slice(0, i);
+      buf = buf.slice(buf[i] === "\r" && buf[i + 1] === "\n" ? i + 2 : i + 1);
+      yield line;
     }
   }
+  // One line -> null, or a finished frame when it is the blank line that ends one.
+  function take(line) {
+    if (line === "") {
+      const frame = data.length ? { event: event || "message", id, data: data.join("\n") } : null;
+      event = ""; id = undefined; data = [];
+      return frame;
+    }
+    if (line.startsWith(":")) return null;
+    const c = line.indexOf(":");
+    const field = c < 0 ? line : line.slice(0, c);
+    let value = c < 0 ? "" : line.slice(c + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "event") event = value;
+    else if (field === "id" && !value.includes("\0")) id = value;
+    else if (field === "data") data.push(value);
+    return null;
+  }
+  for await (const chunk of res.body) {
+    onActivity?.();
+    buf += dec.decode(chunk, { stream: true });
+    if (!started && buf) { started = true; if (buf.charCodeAt(0) === 0xfeff) buf = buf.slice(1); }
+    for (const line of lines(false)) { const f = take(line); if (f) yield f; }
+  }
+  buf += dec.decode();
+  // A frame still missing its blank line when the stream ends is incomplete and dropped (per the spec).
+  for (const line of lines(true)) { const f = take(line); if (f) yield f; }
 }
 
 // Keep the end of long tool output: that is the useful part, and T3 bounds it anyway.

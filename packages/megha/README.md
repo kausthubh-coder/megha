@@ -5,9 +5,10 @@ this machine. T3 starts it as a "Local ACP command" provider. It talks newline-d
 stdio and runs with cwd set to the thread's repo folder.
 
 It reuses the logins of the local CLIs: `~/.codex/auth.json` for Codex and
-`~/.claude/.credentials.json` for Claude. It never refreshes tokens, because refresh tokens rotate and
-a refresh here would log the CLI out. When a token expires, the error tells you to run
-`codex login status` or `claude auth status`, which refresh it.
+`~/.claude/.credentials.json` for Claude (on macOS, the "Claude Code-credentials" Keychain item, read
+with `security find-generic-password`). It never refreshes or writes tokens, because refresh tokens rotate and
+a refresh here would log the CLI out. When a token expires, start `codex` or `claude` once so the CLI
+renews it, or sign in again (`codex login`; `claude`, then `/login`).
 
 ## Run
 
@@ -73,9 +74,18 @@ T3 on Windows refuses `.cmd` shims, so `commandPath` must be `node.exe` and the 
     starting patch against the merge-base with origin. Claude gets a git bundle, which means the
     session can't push a branch back. Untracked files never travel.
 - Images attached in T3 go to the cloud (Codex uploads them as ChatGPT files; Claude gets image
-  blocks). Attached text files up to 64 KB are inlined into the prompt.
+  blocks). Attached text files up to 64 KB are inlined into the prompt, but only files that sit
+  directly in T3's attachment folder (`<T3CODE_HOME or ~/.t3>/userdata/attachments`). Any other path
+  in an attachment line is named in the prompt and not read.
 - Cancel answers T3 within about 1.5 s. The cloud cancel and the end of the cloud turn finish in the
-  background, and the next prompt (a steer) waits for that before it is sent as a follow-up.
+  background. After Stop, megha starts no new cloud or local work for that turn, and it skips the
+  automatic local apply. The next prompt (a steer) waits up to 60 s for the cancelled turn to settle,
+  and is refused if it hasn't.
+- Cloud errors show the HTTP status, the operation and a known error code. megha never shows or logs
+  the response body.
+- megha only lists, imports or continues tasks and sessions of the folder's repo. For Codex it
+  checks the task's environment and repo map; for Claude it checks the session's source or outcome
+  repo, and accepts bundle-seeded sessions only if megha made them in this folder.
 - After a T3 restart, "Continue where you left off." reattaches to a cloud turn that is still running,
   or shows the result of one that finished in the meantime.
 - Slash commands: `/pr` (Codex opens a PR from the latest diff and links it to the thread through T3's
@@ -87,8 +97,9 @@ T3 on Windows refuses `.cmd` shims, so `commandPath` must be `node.exe` and the 
   changes nothing and saves the patch under `%LOCALAPPDATA%\megha\patches`.
 - `session/list` shows this repo's recent cloud tasks, and `session/load` replays one, so T3's
   "List sessions" and "Import" work. The map from T3 session to cloud id lives in
-  `%LOCALAPPDATA%\megha\sessions.json` (ids and settings, never tokens). An older
-  `%LOCALAPPDATA%\cloud-acp\sessions.json` is copied over once.
+  `%LOCALAPPDATA%\megha\sessions\<id>.json`, one file per session so parallel T3 threads can't
+  overwrite each other (ids and settings, never tokens). Records from an older single
+  `sessions.json` (megha 0.1.0, or `%LOCALAPPDATA%\cloud-acp`) are imported once.
 - When T3 replaces the session for a thread (rollback), megha recognises the thread by a hash of T3's
   per-thread MCP credential and keeps using the same cloud task. Without that it starts a new task and
   says so.

@@ -16,6 +16,8 @@ const MODELS = { models: [
 ] };
 const input = (text, extra = []) => cleanPrompt([{ type: "text", text }, ...extra]);
 const thread = (method, params = {}) => ({ item_type: "thread_event", event: { method, params } });
+// Task details name the environment the turn ran in (live shape, research-codex.md §5).
+const WIDGET_ENV = { environment_id: "env_w", environment: { id: "env_w", repo_map: { r: { repository_full_name: "acme/widget" } } } };
 const doneStream = (text) => sse([thread("turn/started"), thread("item/agentMessage/delta", { itemId: "m1", delta: text }), thread("turn/completed", { turn: { status: "completed" } })]);
 
 // A small stateful chatgpt.com: one task whose current turn moves forward on each follow-up.
@@ -34,7 +36,7 @@ function fakeCodex({ byRepo = [], installations = [], envCreated, streamFor } = 
     ["POST", new RegExp(`^${API}/wham/tasks/task_e_1/cancel$`), () => { state.cancelled = true; state.status = "cancelled"; return json({}); }],
     ["GET", new RegExp(`^${API}/wham/tasks/task_e_1/turns/[^/]+/stream$`), (req) => (streamFor ? streamFor(req) : (state.status = "completed", doneStream("Hello from the cloud")))],
     ["GET", new RegExp(`^${API}/wham/tasks/task_e_1$`), () => json({ task: { id: "task_e_1", title: state.taskTitle, current_turn_id: state.turn },
-      current_assistant_turn: { id: state.turn, turn_status: state.status, output_items: [], model_version: "gpt-5.6-sol" } })],
+      current_assistant_turn: { id: state.turn, turn_status: state.status, output_items: [], model_version: "gpt-5.6-sol", ...WIDGET_ENV } })],
   ];
   return { state, routes };
 }
@@ -159,7 +161,7 @@ export async function run() {
   await test("restart continuation: a turn that finished unseen is shown; an already-seen one gets a real follow-up", async () => {
     const fake = fakeCodex(); fake.state.turn = "task_e_1~assttrn_e_8"; fake.state.status = "completed";
     const routes = [["GET", new RegExp(`^${API}/wham/tasks/task_e_1$`), () => json({ task: { id: "task_e_1", title: "t", current_turn_id: fake.state.turn },
-      current_assistant_turn: { id: fake.state.turn, turn_status: fake.state.status, output_items: [],
+      current_assistant_turn: { id: fake.state.turn, turn_status: fake.state.status, output_items: [], ...WIDGET_ENV,
         thread_events: { events: [{ method: "item/completed", params: { item: { id: "m9", type: "agentMessage", text: "Finished while you were away" } } }] } } })], ...fake.routes];
     calls = mockFetch(routes);
     let rec = recorder();
@@ -176,7 +178,7 @@ export async function run() {
     const mcp = [];
     calls = mockFetch([
       ["GET", new RegExp(`^${API}/wham/tasks/task_e_pr$`), () => json({ task: { id: "task_e_pr", external_pull_requests: [] },
-        current_diff_task_turn: { id: "task_e_pr~assttrn_e_5", output_items: [{ type: "pr", output_diff: { diff } }] }, current_assistant_turn: { id: "task_e_pr~assttrn_e_6", output_items: [] } })],
+        current_diff_task_turn: { id: "task_e_pr~assttrn_e_5", output_items: [{ type: "pr", output_diff: { diff } }] }, current_assistant_turn: { id: "task_e_pr~assttrn_e_6", output_items: [], ...WIDGET_ENV } })],
       ["POST", new RegExp(`^${API}/wham/tasks/task_e_pr/turns/task_e_pr~assttrn_e_5/pr$`), () => json({ pull_request: { url: "https://github.com/acme/widget/pull/9" } })],
       ["POST", /^127\.0\.0\.1:4999\/mcp$/, (req) => {
         mcp.push(req.body);

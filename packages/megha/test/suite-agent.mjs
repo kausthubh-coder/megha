@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { MeghaAgent, CANCEL_GRACE_MS } from "../lib/agent.mjs";
-import { test, tmp } from "./harness.mjs";
+import { test, tmp, fakeConn } from "./harness.mjs";
 
 const { fixtures } = JSON.parse(readFileSync(new URL("./fixtures/t3-prompts.json", import.meta.url), "utf8"));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -37,10 +37,6 @@ class FakeBackend {
   async command(s, cmd, io) { this.commandsRun.push(cmd); io.text(`ran /${cmd.name}`); }
 }
 
-function fakeConn() {
-  const notes = [];
-  return { notes, sessionUpdate: async (n) => { notes.push(n); }, requestPermission: async () => ({ outcome: { outcome: "selected", optionId: "allow" } }) };
-}
 const texts = (conn, sessionId) => conn.notes.filter((n) => n.sessionId === sessionId && n.update.sessionUpdate === "agent_message_chunk").map((n) => n.update.content.text).join("");
 
 export async function run() {

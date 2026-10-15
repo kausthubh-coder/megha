@@ -56,13 +56,24 @@ export function fakeJwt(claims) {
   return `${b({ alg: "none" })}.${b(claims)}.sig`;
 }
 
+// Recognizable canaries: none of these may ever reach stdout, stderr, ACP or a file megha writes.
+export const CANARY = {
+  codexRefresh: "canary-codex-refresh-token-7f3a",
+  codexAccount: "acct-canary-0c41",
+  codexIdToken: "canary-codex-id-token-91d2",
+  claudeRefresh: "sk-ant-ort01-canary-refresh-55e0",
+  envSecret: "CANARY_ENV_SECRET_b81f",
+  serverBody: "canary-server-diagnostic-2d6c",
+  initError: "canary-init-error-a9e4",
+};
+
 export function writeFakeLogins(root) {
   const codexHome = join(root, "codex"); mkdirSync(codexHome, { recursive: true });
-  const codexToken = fakeJwt({ exp: Math.floor(Date.now() / 1000) + 3600 });
-  writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: codexToken, account_id: "acct_test" } }));
+  const codexToken = fakeJwt({ exp: Math.floor(Date.now() / 1000) + 3600, canary: "codex-access" });
+  writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: codexToken, refresh_token: CANARY.codexRefresh, id_token: CANARY.codexIdToken, account_id: CANARY.codexAccount } }));
   const claudeHome = join(root, "claude"); mkdirSync(claudeHome, { recursive: true });
   const claudeToken = "test-claude-oauth-token-not-real";
-  writeFileSync(join(claudeHome, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: claudeToken, expiresAt: Date.now() + 3600_000, scopes: ["user:sessions:claude_code"] } }));
+  writeFileSync(join(claudeHome, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: claudeToken, refreshToken: CANARY.claudeRefresh, expiresAt: Date.now() + 3600_000, scopes: ["user:sessions:claude_code"] } }));
   return { codexHome, claudeHome, codexToken, claudeToken };
 }
 
@@ -96,4 +107,46 @@ export function recorder({ signal } = {}) {
   };
 }
 
-export const PNG_1x1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+// A promise you resolve from outside: lets a mocked request stay pending until the test says so.
+export function deferred() {
+  let resolve, reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+// A mocked request that never answers, except by failing when its AbortSignal fires (like fetch).
+export function untilAborted(signal) {
+  return new Promise((_resolve, reject) => {
+    const stop = () => reject(new DOMException("aborted", "AbortError"));
+    if (signal?.aborted) stop(); else signal?.addEventListener("abort", stop, { once: true });
+  });
+}
+export const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Everything the agent sends over ACP, from every fake connection in the run (the secrecy suite
+// scans it at the end).
+export const acpCaptured = [];
+export function fakeConn() {
+  const notes = [];
+  return {
+    notes,
+    sessionUpdate: async (n) => { notes.push(n); acpCaptured.push(n); },
+    requestPermission: async () => ({ outcome: { outcome: "selected", optionId: "allow" } }),
+  };
+}
+// Record an ACP error (or anything else the client would see) for the secrecy suite.
+export function captureAcp(value) {
+  acpCaptured.push(value instanceof Error ? { message: value.message, code: value.code, data: value.data } : value);
+  return value;
+}
+
+// stdout and stderr of the whole offline run, teed (still printed) so the secrecy suite can scan them.
+export const stdio = { out: [], err: [] };
+export function teeStdio() {
+  for (const [name, sink] of [["stdout", stdio.out], ["stderr", stdio.err]]) {
+    const stream = process[name];
+    const write = stream.write.bind(stream);
+    stream.write = (chunk, ...rest) => { sink.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8")); return write(chunk, ...rest); };
+  }
+}
+
+export const PNG_1x1 ="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";

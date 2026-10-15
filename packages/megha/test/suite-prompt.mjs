@@ -44,15 +44,17 @@ export async function run() {
     assert.equal(r.text, "Continue where you left off.");
   });
 
-  await test("attached text file is inlined; binary or missing files are named instead", () => {
+  await test("attached text file (in T3's attachment folder) is inlined; binary or unreadable files are named instead", () => {
     const dir = tmp("att");
     const file = join(dir, "notes.txt");
     writeFileSync(file, "port=3000\nmode=dev\n");
     const blocks = JSON.parse(JSON.stringify(fixtures.withFileAttachment).replace("__ATTACHMENT_PATH__", file.replace(/\\/g, "\\\\")));
-    const r = cleanPrompt(blocks);
+    const opts = { attachmentDirs: [dir] };
+    const r = cleanPrompt(blocks, opts);
     assert.equal(r.text, `Review this config\n\n<attached_file name="notes.txt">\nport=3000\nmode=dev\n</attached_file>`);
-    assert.match(cleanPrompt(fixtures.withFileAttachment, { readFile: () => Buffer.from([0, 1, 2]) }).text, /not sent: it is binary or over 64 KB/);
-    assert.match(cleanPrompt(fixtures.withFileAttachment, { readFile: () => null }).text, /could not be read/);
+    assert.match(cleanPrompt(blocks, { ...opts, readFile: () => Buffer.from([0, 1, 2]) }).text, /not sent: it is binary or over 64 KB/);
+    assert.match(cleanPrompt(blocks, { ...opts, readFile: () => null }).text, /could not be read/);
+    assert.match(cleanPrompt(blocks).text, /megha only sends files from T3's attachment folder/, "outside the folder: named, not read");
   });
 
   await test("image: block kept, its local path line dropped", () => {

@@ -123,3 +123,10 @@ Live-tested 2026-10-14: all read-only commands + create dry-run. create --yes NO
   11 assistant, 9 user (tool results), final 1404-char answer in one event, result at 17.6 s after stream open.
   Other events: env_manager_log, system, ephemeral_event:system, delivery_update, rate_limit_event, active_goal, autocompact_state.
 - `claude --cloud` refuses without a TTY ("--cloud requires an interactive terminal").
+
+## 10. Found while building megha (2026-10-15)
+- Seed bundle refs: the CLI creates a private `refs/seed/<ms>-<16 hex>/stash` (and `/root`) ref and renames it to
+  `refs/seed/stash` inside the bundle header, so concurrent bundles never share a ref. megha does the same.
+- macOS: the login is a Keychain generic password (service "Claude Code-credentials", with a hash suffix when
+  CLAUDE_CONFIG_DIR is set). Read-only lookup: `security find-generic-password -s <service> -w`.
+- Startup failures don't fail the create call: poll the session for `external_metadata.last_init_error` / `status:"failed"`.

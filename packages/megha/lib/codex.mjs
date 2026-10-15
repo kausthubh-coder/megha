@@ -7,6 +7,7 @@ import { join, posix } from "node:path";
 import {
   log, sleep, sseFrames, tail, repoInfo, UserError, isoFromEpochSeconds, saveSessionRecord, cleanTerminal,
   cachedList, readCache, writeCache, localChanges, localPatch, setupCommandsFor, findPullRequestUrl,
+  CloudError, operationLabel, parseJsonBody, throwIfCancelled, boundedSignal,
 } from "./util.mjs";
 import { codexChangesToPatch, diffToolCall, applyLocally, diffFiles } from "./diff.mjs";
 import { imageSize, imageExtension } from "./image.mjs";
@@ -31,7 +32,8 @@ export const FALLBACK_MODELS = [
 const MODES = ["code", "ask", "plan"];
 const PLAN_PREFIX = "Plan mode: investigate with read-only actions and reply with a concrete implementation plan. Do not implement it.\n\n";
 
-const AUTH_HELP = "Run `codex login status` (or any `codex` command) so the Codex CLI refreshes its login, then retry. megha never refreshes tokens itself.";
+// `codex login status` only reads the stored login; the CLI refreshes when it next talks to OpenAI.
+const AUTH_HELP = "Start `codex` once (it renews an expired login when it talks to OpenAI) or run `codex login` again, then retry. megha never refreshes tokens itself.";
 
 export function readAuth() {
   const file = join(process.env.CODEX_HOME || join(homedir(), ".codex"), "auth.json");
@@ -54,25 +56,48 @@ function authHeaders(accept = "application/json") {
   return headers;
 }
 
-async function api(method, path, body, { signal } = {}) {
-  const headers = authHeaders();
-  if (body) headers["Content-Type"] = "application/json";
-  const res = await fetch(BASE + path, { method, headers, body: body ? JSON.stringify(body) : undefined, redirect: "error", signal });
-  const text = await res.text();
-  if (res.status === 401) throw new UserError(`Codex Cloud rejected the ChatGPT token (401). ${AUTH_HELP}`);
-  if (!res.ok) {
-    // Error bodies are short API errors; still cap them so nothing large is echoed.
-    let detail = text.slice(0, 300);
-    try { const j = JSON.parse(text); detail = j.detail?.message ?? j.detail ?? j.error?.message ?? detail; } catch {}
-    throw new Error(`Codex Cloud ${method} ${path.split("?")[0]} failed: HTTP ${res.status} ${typeof detail === "string" ? detail : JSON.stringify(detail).slice(0, 300)}`);
+const LABEL = "Codex Cloud";
+// Every request is bounded, so a stalled connection can't hold a turn open.
+const REQUEST_TIMEOUT_MS = 30_000;
+// Error codes worth naming, with fixed guidance. Any other code, and every error body, is left out of
+// messages: bodies can echo env vars, tokens or account ids.
+const KNOWN_ERROR_CODES = {
+  rate_limit_exceeded: "Rate limited; wait a moment and retry.",
+  usage_limit_reached: "Your Codex usage limit is reached; see chatgpt.com/codex.",
+  environment_not_found: "The environment no longer exists; pick another in the Environment option.",
+  task_not_found: "The task no longer exists on Codex Cloud.",
+  model_not_found: "That model is not available; pick another in the Model option.",
+};
+function knownError(text) {
+  let j; try { j = JSON.parse(text); } catch { return {}; }
+  for (const c of [j?.detail?.code, j?.error?.code, j?.error?.type, j?.code]) {
+    if (typeof c === "string" && Object.hasOwn(KNOWN_ERROR_CODES, c)) return { code: c, guidance: KNOWN_ERROR_CODES[c] };
   }
-  return text ? JSON.parse(text) : {};
+  return {};
 }
 
+// signal: cancel / turn-finished signal for reads. Mutations pass none: once a create or follow-up
+// is sent, megha wants its answer (the new task's id) so it can cancel it in the cloud.
+async function api(method, path, body, { signal, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
+  const headers = authHeaders();
+  if (body) headers["Content-Type"] = "application/json";
+  const operation = operationLabel(method, path);
+  const res = await fetch(BASE + path, { method, headers, body: body ? JSON.stringify(body) : undefined, redirect: "error", signal: boundedSignal(signal, timeoutMs) });
+  const text = await res.text();
+  if (res.status === 401) throw new UserError(`Codex Cloud rejected the ChatGPT token (401). ${AUTH_HELP}`);
+  if (!res.ok) throw new CloudError({ label: LABEL, operation, status: res.status, ...knownError(text) });
+  return parseJsonBody(text, LABEL, operation);
+}
+
+// Bounded until the response headers arrive; after that the stream lives until `signal` aborts.
 async function openStream(path, signal) {
-  const res = await fetch(BASE + path, { headers: authHeaders("text/event-stream"), signal, redirect: "error" });
-  if (!res.ok) throw new Error(`Codex Cloud stream failed: HTTP ${res.status}`);
-  return res;
+  const connect = new AbortController();
+  const t = setTimeout(() => connect.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(BASE + path, { headers: authHeaders("text/event-stream"), signal: AbortSignal.any([signal, connect.signal]), redirect: "error" });
+    if (!res.ok) { await res.body?.cancel().catch(() => {}); throw new CloudError({ label: LABEL, operation: "stream", status: res.status }); }
+    return res;
+  } finally { clearTimeout(t); }
 }
 
 const enc = encodeURIComponent;
@@ -82,6 +107,19 @@ const message = (text) => ({ type: "message", role: "user", content: [{ content_
 // Environments: keep only the fields we show. The API also returns env_vars/secrets; never keep those.
 const slimEnv = (e) => ({ id: e.id, label: e.label ?? e.id, pinned: !!e.is_pinned, taskCount: e.task_count ?? 0,
   repos: Object.values(e.repo_map ?? {}).map((r) => r.repository_full_name).filter(Boolean) });
+const fullName = (repo) => (repo?.github ? `${repo.github.owner}/${repo.github.name}`.toLowerCase() : null);
+// An environment is this repo's only if its repo map names the repo. Labels are not identity.
+export const envsForRepo = (envs, full) => (full ? envs.filter((e) => (e.repos ?? []).some((r) => String(r).toLowerCase() === full)) : []);
+
+// Which repo a task belongs to, from GET /wham/tasks/{id}: the assistant turn carries the environment
+// it ran in (environment_id + environment.repo_map; research-codex.md §5).
+export function taskRepos(details) {
+  const turn = details?.current_assistant_turn ?? {};
+  return {
+    envId: turn.environment_id ?? turn.environment?.id ?? null,
+    repos: Object.values(turn.environment?.repo_map ?? {}).map((r) => String(r?.repository_full_name ?? "").toLowerCase()).filter(Boolean),
+  };
+}
 
 // Only environments that belong to this repo: a task in another repo's environment edits the wrong code.
 export function pickDefaultEnv(envs, repoName) {
@@ -146,24 +184,61 @@ export class CodexBackend {
     { name: "status", description: "Show the cloud task's status" },
   ];
 
+  // pollMs: how often a running turn is polled (tests shorten it).
+  constructor({ pollMs = POLL_MS } = {}) { this.pollMs = pollMs; }
+
   checkAuth() { readAuth(); }
   webUrl(id) { return taskUrl(id); }
 
   async #models() {
     return cachedList("models-codex", 10 * 60_000, async () =>
-      modelsFromResponse(await api("GET", `/wham/models?client_version=${CLIENT_VERSION}`, undefined, { signal: AbortSignal.timeout(5000) })), FALLBACK_MODELS);
+      modelsFromResponse(await api("GET", `/wham/models?client_version=${CLIENT_VERSION}`, undefined, { timeoutMs: 5000 })), FALLBACK_MODELS);
   }
 
-  // Environments for this repo (by-repo lookup only). Slim records are safe to cache on disk.
+  // Environments for this repo: the by-repo lookup, kept only where the environment's repo map names
+  // this repo. Slim records are safe to cache on disk.
   async #environments(repo) {
     if (!repo?.github) return [];
+    const full = fullName(repo);
     const key = `envs-codex-${repo.github.owner}-${repo.github.name}`.toLowerCase().replace(/[^a-z0-9_.-]+/g, "_");
     const hit = readCache(key, 2 * 60_000);
-    if (hit?.fresh && Array.isArray(hit.value)) return hit.value;
-    const envs = (await api("GET", `/wham/environments/by-repo/github/${enc(repo.github.owner)}/${enc(repo.github.name)}`)).map(slimEnv)
+    if (hit?.fresh && Array.isArray(hit.value)) return envsForRepo(hit.value, full);
+    const envs = envsForRepo((await api("GET", `/wham/environments/by-repo/github/${enc(repo.github.owner)}/${enc(repo.github.name)}`)).map(slimEnv), full)
       .sort((a, b) => (b.pinned - a.pinned) || a.label.localeCompare(b.label));
     writeCache(key, envs);
     return envs;
+  }
+
+  // Throws unless `value` is an environment for this session's repo (or "none", or the offer to
+  // create one). Environment ids from the client or an old record are never trusted as-is.
+  #checkEnvironment(session, value) {
+    if (value === "none") return;
+    if (session.creatable && value === `create:${session.creatable.fullName}`) return;
+    if (envsForRepo(session.envs ?? [], fullName(session.repo)).some((e) => e.id === value)) return;
+    throw new UserError(`${String(value).slice(0, 80)} is not an environment for ${fullName(session.repo) ?? "this folder's repo"}. Pick one from the Environment option.`);
+  }
+
+  // Throws unless the task (GET /wham/tasks/{id} response) ran in an environment of this repo.
+  #checkTask(session, details) {
+    const full = fullName(session.repo);
+    const { envId, repos } = taskRepos(details);
+    const ok = full && (repos.length ? repos.includes(full) : !!envId && envsForRepo(session.envs ?? [], full).some((e) => e.id === envId));
+    if (!ok) {
+      throw new UserError(repos.length
+        ? `This Codex Cloud task belongs to ${repos.join(", ")}, not ${full ?? "this folder's repo"}, so megha won't open or continue it here.`
+        : `megha can't confirm this Codex Cloud task belongs to ${full ?? "this folder's repo"}, so it won't open or continue it here.`);
+    }
+    session.repoChecked = true;
+  }
+
+  // session/load and session/resume of a cloud id: confirm it is this repo's task first.
+  async checkRepo(session) {
+    session.repo ??= await repoInfo(session.cwd);
+    this.#checkTask(session, await api("GET", `/wham/tasks/${enc(session.cloudId)}`));
+  }
+
+  async #cancelTask(session) {
+    try { await api("POST", `/wham/tasks/${enc(session.cloudId)}/cancel`); log("cancel requested"); } catch (e) { log(`cancel failed: ${e.message}`); }
   }
 
   // Is the repo visible to the ChatGPT GitHub connector (so an environment can be created for it)?
@@ -241,6 +316,7 @@ export class CodexBackend {
     if (!(id in allowed)) throw new UserError(`Unknown config option ${id}`);
     if (allowed[id] && !allowed[id].includes(value)) throw new UserError(`Invalid value ${value} for ${id}`);
     if (id === "model" && !/^[\w.:-]+$/.test(value)) throw new UserError(`Invalid model ${value}`);
+    if (id === "environment") this.#checkEnvironment(session, value);
     session.config[id] = value;
   }
 
@@ -267,10 +343,14 @@ export class CodexBackend {
 
   async #ensureEnvironment(session, io) {
     const cfg = session.config;
-    if (cfg.environment && cfg.environment !== "none" && !cfg.environment.startsWith("create:")) return cfg.environment;
+    if (cfg.environment && cfg.environment !== "none" && !cfg.environment.startsWith("create:")) {
+      this.#checkEnvironment(session, cfg.environment); // right before creating a task in it
+      return cfg.environment;
+    }
     if (!cfg.environment?.startsWith("create:") || !session.creatable) throw new UserError(this.#noEnvMessage(session));
     const repo = session.repo;
     const setup = setupCommandsFor(repo.root);
+    throwIfCancelled(io.signal);
     const created = await api("POST", "/wham/environments", environmentBody({ ...session.creatable, label: repo.github.name, setup }));
     if (!created?.id) throw new Error("Codex Cloud created an environment but returned no id");
     const env = slimEnv(created);
@@ -288,26 +368,29 @@ export class CodexBackend {
 
   // ChatGPT file upload, as the desktop app does for composer images: create entry -> PUT the bytes
   // to the returned blob URL -> mark uploaded. The upload URL embeds a signed credential: never log it.
-  async #uploadImage(img, index) {
+  async #uploadImage(img, index, signal) {
     const bytes = Buffer.from(img.data, "base64");
     const size = imageSize(bytes) ?? { width: 1, height: 1 };
+    throwIfCancelled(signal);
     const entry = await api("POST", "/files", { file_name: `image-${index + 1}.${imageExtension(img.mimeType)}`, file_size: bytes.length, use_case: "codex",
       timezone_offset_min: new Date().getTimezoneOffset(), reset_rate_limits: false });
     if (!entry?.file_id || !entry.upload_url) throw new Error("Codex Cloud returned no upload slot for an image");
     const url = new URL(entry.upload_url, WEB);
+    throwIfCancelled(signal);
+    const uploadSignal = boundedSignal(signal, 120_000);
     let res;
     if (url.pathname.endsWith("/estuary/upload_content_bytes")) {
       const form = new FormData();
       form.append("file", new Blob([bytes], { type: img.mimeType }), `image-${index + 1}.${imageExtension(img.mimeType)}`);
-      const h = authHeaders(); res = await fetch(url, { method: "POST", headers: h, body: form, redirect: "error" });
+      const h = authHeaders(); res = await fetch(url, { method: "POST", headers: h, body: form, redirect: "error", signal: uploadSignal });
     } else {
       const target = url.href.toLowerCase().includes("estuary") ? url.searchParams.get("upload_url") : url.href;
       if (!target) throw new Error("Codex Cloud image upload URL is missing its blob target");
-      res = await fetch(target, { method: "PUT", body: bytes, redirect: "error",
+      res = await fetch(target, { method: "PUT", body: bytes, redirect: "error", signal: uploadSignal,
         headers: { "Content-Type": img.mimeType, "x-ms-blob-type": "BlockBlob", "x-ms-version": "2020-04-08", "x-ms-blob-content-type": img.mimeType } });
     }
-    if (!res.ok) throw new Error(`Codex Cloud image upload failed: HTTP ${res.status}`);
-    await res.text().catch(() => {});
+    await res.text().catch(() => {}); // the blob service's reply is never shown or logged
+    if (!res.ok) throw new CloudError({ label: LABEL, operation: "image upload", status: res.status });
     try { await api("POST", `/files/${enc(entry.file_id)}/uploaded`, {}); } catch (e) { log(`image finalize failed: ${e.message}`); }
     const id = entry.file_id;
     return { type: "image_asset_pointer", asset_pointer: id.startsWith("file_") ? `sediment://${id}` : `file-service://${id}`, width: size.width, height: size.height, size_bytes: bytes.length };
@@ -315,14 +398,19 @@ export class CodexBackend {
 
   async #imageItems(images, io) {
     const items = [];
-    for (const [i, img] of images.entries()) items.push(await this.#uploadImage(img, i));
+    for (const [i, img] of images.entries()) items.push(await this.#uploadImage(img, i, io.signal));
     if (items.length) io.text(`Sent ${items.length} image${items.length === 1 ? "" : "s"} with the prompt.\n\n`);
     return items;
   }
 
   // ---------- prompt ----------
+  // Cancellation: every await before the create/follow-up POST takes io.signal, and the signal is
+  // checked right before each mutation. Once the POST is sent its answer is awaited (not aborted), so a
+  // turn started just as Stop arrived is known by id and cancelled in the cloud.
   async prompt(session, input, io) {
+    const { signal } = io;
     const cfg = session.config;
+    session.repo ??= await repoInfo(session.cwd);
     if (input.isContinue && session.cloudId) {
       const r = await this.#continueTurn(session, io);
       if (r) return r;
@@ -348,26 +436,33 @@ export class CodexBackend {
           io.text(`Sending your local changes as the starting patch (${diffFiles(patch).length} files; ${info.unpushed} commit${info.unpushed === 1 ? "" : "s"} not on origin, ${info.dirty.length} uncommitted; untracked files are not included).\n\n`);
         }
       }
-      const res = await api("POST", "/wham/tasks", { new_task: { environment_id: environmentId, branch, run_environment_in_qa_mode: cfg.mode !== "code" }, ...metadata, input_items });
+      throwIfCancelled(signal);
+      const res = await api("POST", "/wham/tasks", { new_task: { environment_id: environmentId, branch, run_environment_in_qa_mode: cfg.mode !== "code" }, ...metadata, input_items }, { timeoutMs: 60_000 });
       session.cloudId = res?.task?.id ?? res?.id;
       if (!session.cloudId) throw new Error("Codex Cloud created a task but returned no id");
       session.webUrl = taskUrl(session.cloudId);
       session.title = res?.task?.title ?? session.title;
+      session.repoChecked = true; // created in an environment checked against this repo just above
       saveSessionRecord(session);
       log(`created task ${session.cloudId} (model ${cfg.model})`);
-      turnId = typeof res?.turn?.id === "string" && res.turn.id.includes("assttrn") ? res.turn.id : await this.#waitForNewTurn(session.cloudId, null, io.signal);
+      if (signal.aborted) { await this.#cancelTask(session); return "cancelled"; }
+      turnId = typeof res?.turn?.id === "string" && res.turn.id.includes("assttrn") ? res.turn.id : await this.#waitForNewTurn(session.cloudId, null, signal);
     } else {
-      const before = await api("GET", `/wham/tasks/${enc(session.cloudId)}`);
+      const before = await api("GET", `/wham/tasks/${enc(session.cloudId)}`, undefined, { signal });
+      this.#checkTask(session, before);
       const prev = before.task?.current_turn_id ?? session.turnId;
+      const images = await this.#imageItems(input.images, io);
+      throwIfCancelled(signal);
       const res = await api("POST", "/wham/tasks", {
         follow_up: { task_id: session.cloudId, turn_id: prev, environment_mode: cfg.mode === "code" ? "code" : "ask" },
-        ...metadata, input_items: [message(text), ...(await this.#imageItems(input.images, io))],
-      });
-      turnId = typeof res?.turn?.id === "string" && res.turn.id.includes("assttrn") && res.turn.id !== prev ? res.turn.id : await this.#waitForNewTurn(session.cloudId, prev, io.signal);
+        ...metadata, input_items: [message(text), ...images],
+      }, { timeoutMs: 60_000 });
+      if (signal.aborted) { await this.#cancelTask(session); return "cancelled"; }
+      turnId = typeof res?.turn?.id === "string" && res.turn.id.includes("assttrn") && res.turn.id !== prev ? res.turn.id : await this.#waitForNewTurn(session.cloudId, prev, signal);
     }
     if (!turnId) {
       // Cancelled before the cloud reported the new turn: cancel the task's running turn and stop.
-      try { await api("POST", `/wham/tasks/${enc(session.cloudId)}/cancel`); log("cancel requested"); } catch (e) { log(`cancel failed: ${e.message}`); }
+      await this.#cancelTask(session);
       return "cancelled";
     }
     session.turnId = turnId;
@@ -379,7 +474,8 @@ export class CodexBackend {
   // T3's automatic "Continue where you left off." after a restart: if the cloud turn is still running,
   // follow it; if it finished while nobody watched, show its result. Otherwise it is a normal prompt.
   async #continueTurn(session, io) {
-    const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`);
+    const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`, undefined, { signal: io.signal });
+    this.#checkTask(session, d);
     const turn = d.current_assistant_turn;
     if (!turn?.id) return null;
     session.title = d.task?.title ?? session.title;
@@ -395,13 +491,14 @@ export class CodexBackend {
     io.text("The cloud turn finished while T3 Code was away. Its result:\n\n");
     const st = new TurnState(session, io, turn.id, { replay: true });
     st.catchUp(turn.thread_events?.events ?? []);
-    if (!st.sawText) for (const m of turnMessages(turn)) st.text(m);
+    st.fallbackMessages(turnMessages(turn));
     return this.#afterTurn(session, { status: turn.turn_status, error: turn.error?.message }, io);
   }
 
   async #afterTurn(session, result, io) {
     if (session.title) io.update({ sessionUpdate: "session_info_update", title: session.title, updatedAt: new Date().toISOString() });
-    if (result.status === "completed") await this.#finishDiff(session, io);
+    // After Stop nothing more happens locally: no diff fetch, no automatic apply.
+    if (result.status === "completed" && !io.signal.aborted) await this.#finishDiff(session, io);
     if (TERMINAL.has(result.status)) session.doneTurnId = session.turnId;
     io.text(`\n\n[Open in Codex Cloud](${session.webUrl})`);
     saveSessionRecord(session);
@@ -412,7 +509,8 @@ export class CodexBackend {
 
   async #waitForNewTurn(taskId, previous, signal) {
     for (let i = 0; i < 60 && !signal?.aborted; i++) {
-      const d = await api("GET", `/wham/tasks/${enc(taskId)}`);
+      let d;
+      try { d = await api("GET", `/wham/tasks/${enc(taskId)}`, undefined, { signal }); } catch (e) { if (signal?.aborted) return null; throw e; }
       const id = d.current_assistant_turn?.id ?? d.task?.current_turn_id;
       if (id && id !== previous && id.includes("assttrn")) return id;
       await sleep(1000, signal);
@@ -430,7 +528,7 @@ export class CodexBackend {
     let cancelSent = false;
     const onAbort = async () => {
       if (cancelSent) return; cancelSent = true;
-      try { await api("POST", `/wham/tasks/${enc(session.cloudId)}/cancel`); log("cancel requested"); } catch (e) { log(`cancel failed: ${e.message}`); }
+      await this.#cancelTask(session);
     };
     io.signal.addEventListener("abort", onAbort, { once: true });
     if (io.signal.aborted) onAbort();
@@ -465,23 +563,28 @@ export class CodexBackend {
       let cancelDeadline = null;
       while (!finished) {
         // A cancel wakes the poller, which then polls faster so the background wind-down ends soon.
-        await sleep(io.signal.aborted ? 2000 : POLL_MS, io.signal.aborted ? ac.signal : AbortSignal.any([ac.signal, io.signal]));
+        await sleep(io.signal.aborted ? Math.min(2000, this.pollMs) : this.pollMs, io.signal.aborted ? ac.signal : AbortSignal.any([ac.signal, io.signal]));
         if (finished) return;
         if (io.signal.aborted) cancelDeadline ??= Date.now() + 30_000;
         try {
-          const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`);
+          // ac.signal: the turn finishing (via the stream) aborts a poll still in flight.
+          const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`, undefined, { signal: ac.signal });
           session.title = d.task?.title ?? session.title;
           const turn = d.current_assistant_turn;
           if (turn?.id === turnId && TERMINAL.has(turn.turn_status)) {
             // Give the stream a moment to deliver the tail, then fill gaps from the stored events.
-            await sleep(1500);
+            await sleep(1500, ac.signal);
             if (finished) return;
             st.catchUp(turn.thread_events?.events ?? []);
-            if (!st.sawText) for (const m of turnMessages(turn)) st.text(m);
+            st.fallbackMessages(turnMessages(turn));
             finish({ status: turn.turn_status, error: turn.error?.message, via: "poll" });
             return;
           }
-        } catch (e) { if (e instanceof UserError) { finish({ status: "failed", error: e.message }); return; } log(`poll failed: ${e.message}`); }
+        } catch (e) {
+          if (finished) return;
+          if (e instanceof UserError) { finish({ status: "failed", error: e.message }); return; }
+          log(`poll failed: ${e.message}`);
+        }
         if (cancelDeadline && Date.now() > cancelDeadline) { finish({ status: "cancelled" }); return; }
         if (Date.now() - startedAt > 3 * 3600_000) { finish({ status: "failed", error: "timed out after 3 h" }); return; }
       }
@@ -496,8 +599,9 @@ export class CodexBackend {
     return { status, error: finished?.error };
   }
 
-  async #latestDiff(session) {
-    const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`);
+  async #latestDiff(session, signal) {
+    const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`, undefined, { signal });
+    this.#checkTask(session, d);
     session.title = d.task?.title ?? session.title;
     // The PR endpoint wants the turn that holds the diff.
     const diffTurn = turnDiff(d.current_diff_task_turn) ? d.current_diff_task_turn : turnDiff(d.current_assistant_turn) ? d.current_assistant_turn : null;
@@ -509,15 +613,16 @@ export class CodexBackend {
     // The diff lands in output_items once the turn is done; it can lag turn/completed a little.
     let latest = null;
     for (let i = 0; i < 4; i++) {
-      latest = await this.#latestDiff(session);
+      latest = await this.#latestDiff(session, io.signal);
       if (latest.diff || !(latest.stats?.files_modified > 0)) break;
-      await sleep(2000);
+      await sleep(2000, io.signal);
     }
     const diff = latest?.diff;
-    if (!diff) return;
+    if (!diff || io.signal.aborted) return;
     io.update(diffToolCall({ toolCallId: `diff:${session.turnId}`, diff, cwd: session.cwd }));
     const n = diffFiles(diff).length;
     if (session.config.apply === "on") {
+      throwIfCancelled(io.signal);
       const r = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${session.turnId.split("~").pop()}`, previousFile: session.appliedPatchFile });
       if (r.ok && !r.unchanged) session.appliedPatchFile = r.patchFile;
       io.text(`\n\n${r.message} Type /pr to open a pull request.`);
@@ -530,9 +635,11 @@ export class CodexBackend {
   async command(session, { name, args }, io) {
     if (name === "open") { io.text(session.webUrl ? `[Open in Codex Cloud](${session.webUrl})` : "No cloud task yet: send a prompt first."); return; }
     if (!session.cloudId) { io.text("No cloud task yet: send a prompt first."); return; }
+    session.repo ??= await repoInfo(session.cwd);
     switch (name) {
       case "status": {
-        const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`);
+        const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`, undefined, { signal: io.signal });
+        this.#checkTask(session, d);
         const t = d.current_assistant_turn ?? {};
         const disp = d.task?.task_status_display ?? {};
         const st = disp.latest_turn_status_display?.diff_stats;
@@ -543,8 +650,9 @@ export class CodexBackend {
         return;
       }
       case "apply": {
-        const { diff, turnId } = await this.#latestDiff(session);
+        const { diff, turnId } = await this.#latestDiff(session, io.signal);
         if (!diff) { io.text("The cloud task has no diff to apply yet."); return; }
+        throwIfCancelled(io.signal);
         const r = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${String(turnId).split("~").pop()}`, previousFile: session.appliedPatchFile });
         if (r.ok && !r.unchanged) session.appliedPatchFile = r.patchFile;
         saveSessionRecord(session);
@@ -557,15 +665,16 @@ export class CodexBackend {
           io.text(`This task already has a pull request: ${session.prUrl}${linked ? `\n\n${linked}` : ""}`);
           return;
         }
-        const { diff, turnId, task } = await this.#latestDiff(session);
+        const { diff, turnId, task } = await this.#latestDiff(session, io.signal);
         const existing = findPullRequestUrl(task?.external_pull_requests);
         if (existing) session.prUrl = existing;
         else {
           if (!diff) { io.text("The cloud task has no diff yet, so there is nothing to open a pull request from."); return; }
-          const res = await api("POST", `/wham/tasks/${enc(session.cloudId)}/turns/${enc(turnId)}/pr`, args === "draft" ? { mode: "draft" } : {});
+          throwIfCancelled(io.signal);
+          const res = await api("POST", `/wham/tasks/${enc(session.cloudId)}/turns/${enc(turnId)}/pr`, args === "draft" ? { mode: "draft" } : {}, { timeoutMs: 60_000 });
           session.prUrl = findPullRequestUrl(res);
-          for (let i = 0; i < 5 && !session.prUrl; i++) {
-            await sleep(2000);
+          for (let i = 0; i < 5 && !session.prUrl && !io.signal.aborted; i++) {
+            await sleep(2000, io.signal);
             const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`);
             session.prUrl = findPullRequestUrl(d.task?.external_pull_requests) ?? findPullRequestUrl(d.task?.pull_requests);
           }
@@ -583,36 +692,49 @@ export class CodexBackend {
   // ---------- list / load ----------
   async list(cwd, cursor) {
     const repo = await repoInfo(cwd);
-    const labels = new Set((await this.#environments(repo)).map((e) => e.label));
+    const envs = await this.#environments(repo);
+    const labels = new Set(envs.map((e) => e.label));
     if (!labels.size) return { sessions: [] };
     // /wham/tasks/list ignores environment_id (checked live), and list items carry only the env label,
-    // so page through and keep tasks whose environment belongs to this repo.
-    const sessions = [];
+    // which is not unique ("Default" in two repos). The label only narrows the candidates; each one is
+    // then confirmed from its details (environment id + repo map) before it is listed.
+    const candidates = [];
     let next = cursor ?? null;
-    for (let page = 0; page < 5 && sessions.length < 20; page++) {
+    for (let page = 0; page < 5 && candidates.length < 20; page++) {
       const q = new URLSearchParams({ limit: "20", task_filter: "current" });
       if (next) q.set("cursor", next);
       const res = await api("GET", `/wham/tasks/list?${q}`);
-      for (const t of res.items ?? []) {
-        const d = t.task_status_display ?? {};
-        if (!labels.has(d.environment_label)) continue;
-        sessions.push({ sessionId: t.id, cwd, title: t.title ?? null,
-          updatedAt: isoFromEpochSeconds(t.updated_at) ?? isoFromEpochSeconds(t.created_at),
-          _meta: { environment: d.environment_label, branch: d.branch_name ?? null, status: d.latest_turn_status_display?.turn_status ?? null } });
-      }
+      for (const t of res.items ?? []) if (labels.has(t.task_status_display?.environment_label)) candidates.push(t);
       next = res.cursor ?? null;
       if (!next) break;
     }
+    const probe = { repo, envs };
+    const confirmed = await mapLimit(candidates, 6, async (t) => {
+      let d;
+      try { d = await api("GET", `/wham/tasks/${enc(t.id)}`); } catch (e) {
+        if (e instanceof UserError) throw e; // signed out: say so instead of listing nothing
+        log(`list: could not check a task (${e.message})`);
+        return null;
+      }
+      try { this.#checkTask({ ...probe }, d); return t; } catch { return null; } // another repo's task
+    });
+    const sessions = confirmed.filter(Boolean).map((t) => {
+      const d = t.task_status_display ?? {};
+      return { sessionId: t.id, cwd, title: t.title ?? null,
+        updatedAt: isoFromEpochSeconds(t.updated_at) ?? isoFromEpochSeconds(t.created_at),
+        _meta: { environment: d.environment_label, branch: d.branch_name ?? null, status: d.latest_turn_status_display?.turn_status ?? null } };
+    });
     return { sessions, ...(next ? { nextCursor: next } : {}) };
   }
 
   // Bind to an existing task and replay its turns (user prompts + stored app-server thread_events).
   async replay(session, io) {
-    const map = await api("GET", `/wham/tasks/${enc(session.cloudId)}/turns`);
+    const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`, undefined, { signal: io.signal });
+    this.#checkTask(session, d);
+    const map = await api("GET", `/wham/tasks/${enc(session.cloudId)}/turns`, undefined, { signal: io.signal });
     const turns = map.turn_mapping ?? {};
     const path = [];
     for (let id = map.current_turn_id; id && turns[id] && path.length < 500; id = turns[id].parent) path.unshift(turns[id]);
-    const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`);
     session.title = d.task?.title ?? session.title;
     session.webUrl = taskUrl(session.cloudId);
     const updates = [];
@@ -629,7 +751,7 @@ export class CodexBackend {
       }
       const st = new TurnState(session, collect, node.id, { replay: true });
       st.catchUp(turn.thread_events?.events ?? []);
-      if (!st.sawText) for (const m of turnMessages(turn)) st.text(m);
+      st.fallbackMessages(turnMessages(turn));
       const diff = turnDiff(turn);
       if (diff) updates.push(diffToolCall({ toolCallId: `diff:${node.id}`, diff, cwd: session.cwd }));
       session.turnId = node.id;
@@ -639,6 +761,15 @@ export class CodexBackend {
     for (const u of updates) io.update(u);
     saveSessionRecord(session);
   }
+}
+
+// Run fn over items with at most `limit` in flight; results keep the input order.
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => { while (next < items.length) { const i = next++; out[i] = await fn(items[i]); } };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
 }
 
 function turnMessages(turn) {
@@ -654,12 +785,40 @@ function turnMessages(turn) {
 export class TurnState {
   constructor(session, io, turnId, { replay = false } = {}) {
     this.session = session; this.io = io; this.turnId = turnId; this.replay = replay;
-    this.deltaItems = new Set(); this.doneItems = new Set(); this.startedTools = new Set();
-    this.sawText = false; this.remoteCwd = null;
+    this.doneItems = new Set(); this.startedTools = new Set();
+    // itemId -> the text of that message/reasoning item shown so far. A stream can drop after a
+    // prefix; the stored complete item then supplies only the missing rest.
+    this.shown = new Map();
+    this.answer = ""; // all answer text shown this turn
+    this.messageDone = false; // a complete agentMessage item was seen
+    this.remoteCwd = null;
     this.setup = null; // {id, lines}
   }
-  text(t) { if (t) { this.sawText = true; this.io.update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: t } }); } }
+  text(t) { if (t) { this.answer += t; this.io.update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: t } }); } }
   thought(t) { if (t) this.io.update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: t } }); }
+  #emit(kind, t) { if (kind === "text") this.text(t); else this.thought(t); }
+  #delta(itemId, t, kind) {
+    if (!t) return;
+    this.shown.set(itemId, (this.shown.get(itemId) ?? "") + t);
+    this.#emit(kind, t);
+  }
+  // The complete text of an item: show what the stream did not.
+  #complete(itemId, full, kind) {
+    if (!full) return;
+    const shown = this.shown.get(itemId) ?? "";
+    if (!shown) this.#emit(kind, full);
+    else if (full.startsWith(shown)) this.#emit(kind, full.slice(shown.length));
+    // else the streamed text differs from the stored text; keep what was shown rather than repeat it.
+    this.shown.set(itemId, full);
+  }
+  // Last resort when the stored events hold no complete message: the turn's output_items messages.
+  fallbackMessages(messages) {
+    if (this.messageDone) return;
+    const all = messages.filter(Boolean).join("\n\n");
+    if (!all) return;
+    if (!this.answer) this.text(all);
+    else if (all.startsWith(this.answer)) this.text(all.slice(this.answer.length));
+  }
   // Cloud paths (/workspace/<repo>/...) -> paths in the local checkout.
   local(p) {
     if (typeof p !== "string" || !p) return p;
@@ -692,9 +851,9 @@ export class TurnState {
     switch (method) {
       case "thread/started": this.remoteCwd = p.thread?.cwd ?? this.remoteCwd; return null;
       case "turn/started": this.closeSetup(); return null;
-      case "item/agentMessage/delta": this.deltaItems.add(p.itemId); this.text(p.delta); return null;
-      case "item/reasoning/summaryTextDelta": this.deltaItems.add(p.itemId); this.thought(p.delta); return null;
-      case "item/reasoning/summaryPartAdded": if (this.deltaItems.has(p.itemId)) this.thought("\n\n"); return null;
+      case "item/agentMessage/delta": this.#delta(p.itemId, p.delta, "text"); return null;
+      case "item/reasoning/summaryTextDelta": this.#delta(p.itemId, p.delta, "thought"); return null;
+      case "item/reasoning/summaryPartAdded": if (this.shown.has(p.itemId)) this.#delta(p.itemId, "\n\n", "thought"); return null;
       case "item/started": this.itemStarted(p.item); return null;
       case "item/completed": this.itemCompleted(p.item); return null;
       case "turn/plan/updated": {
@@ -768,8 +927,8 @@ export class TurnState {
     if (!item?.id || this.doneItems.has(item.id)) return;
     this.doneItems.add(item.id);
     this.closeSetup();
-    if (item.type === "agentMessage") { if (!this.deltaItems.has(item.id)) this.text(item.text); return; }
-    if (item.type === "reasoning") { if (!this.deltaItems.has(item.id)) this.thought((item.summary ?? []).join("\n\n")); return; }
+    if (item.type === "agentMessage") { this.messageDone = true; this.#complete(item.id, item.text, "text"); return; }
+    if (item.type === "reasoning") { this.#complete(item.id, (item.summary ?? []).join("\n\n"), "thought"); return; }
     if (item.type === "userMessage") return; // user prompts come from the user turn's input_items
     const tool = this.toolFor(item);
     if (!tool) return;
