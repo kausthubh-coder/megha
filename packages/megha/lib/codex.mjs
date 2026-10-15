@@ -691,6 +691,16 @@ export class CodexBackend {
     clearTimeout(deadline);
     clearTimeout(stopTimer);
     io.signal.removeEventListener("abort", onAbort);
+    // Streamed text whose item never completed on the stream (the stream also loses item/completed,
+    // or ended early): read the stored turn once for the complete items before showing held deltas.
+    if (st.hasHeld && !io.signal.aborted) {
+      try {
+        const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`, undefined, { signal: io.signal });
+        const turn = d.current_assistant_turn;
+        if (turn?.id === turnId) { st.catchUp(turn.thread_events?.events ?? []); st.fallbackMessages(turnMessages(turn)); }
+      } catch (e) { if (!io.signal.aborted) log(`turn read failed: ${describeError(e)}`); }
+    }
+    st.flushHeld();
     st.closeSetup();
     log(`turn ${finished?.status} via ${finished?.via ?? "?"}${finished?.unconfirmed ? " (stop not confirmed)" : ""}`);
     if (stopping === "timeout" && finished?.status !== "completed") {
@@ -897,9 +907,11 @@ export class TurnState {
   constructor(session, io, turnId, { replay = false } = {}) {
     this.session = session; this.io = io; this.turnId = turnId; this.replay = replay;
     this.doneItems = new Set(); this.startedTools = new Set();
-    // itemId -> the text of that message/reasoning item shown so far. A stream can drop after a
-    // prefix; the stored complete item then supplies only the missing rest.
-    this.shown = new Map();
+    // The live stream loses deltas: it can skip words mid-message and drop a message's tail, and
+    // nothing in a delta shows the gap (research-codex.md §9). So deltas are only held here, per item,
+    // and an item's text is shown once, whole, from its completed form (item/completed live, the
+    // stored thread_events, or output_items). itemId -> {kind, text} streamed but not shown yet.
+    this.held = new Map();
     this.textItems = new Set(); // ids of agentMessage items (answer text, as opposed to reasoning)
     this.answer = ""; // all answer text shown this turn
     this.errorCode = null; // allowlisted code of a non-retried `error` event (never its message)
@@ -910,41 +922,38 @@ export class TurnState {
   thought(t) { if (t) this.io.update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: t } }); }
   #emit(kind, t) { if (kind === "text") this.text(t); else this.thought(t); }
   #delta(itemId, t, kind) {
-    if (!t) return;
+    if (!t || this.doneItems.has(itemId)) return;
     if (kind === "text") this.textItems.add(itemId);
-    this.shown.set(itemId, (this.shown.get(itemId) ?? "") + t);
-    this.#emit(kind, t);
+    const h = this.held.get(itemId) ?? { kind, text: "" };
+    h.text += t;
+    this.held.set(itemId, h);
   }
-  // The complete text of an item: show what the stream did not.
+  // The complete text of an item, shown whole: never the held deltas, which may have gaps.
   #complete(itemId, full, kind) {
+    this.held.delete(itemId);
     if (!full) return;
     if (kind === "text") this.textItems.add(itemId);
-    const shown = this.shown.get(itemId) ?? "";
-    if (!shown) this.#emit(kind, full);
-    else if (full.startsWith(shown)) this.#emit(kind, full.slice(shown.length));
-    // else the streamed text differs from the stored text; keep what was shown rather than repeat it.
-    this.shown.set(itemId, full);
+    this.#emit(kind, full);
   }
+  get hasHeld() { return this.held.size > 0; }
   // The turn's output_items messages, for whatever the stream and the stored events didn't show. Each
   // message is reconciled on its own (a completed commentary message says nothing about the final
-  // answer): one already shown is skipped, one a streamed item only began gets the rest of its text,
-  // and one never seen is shown whole.
+  // answer): one already shown is skipped, and one not shown yet is shown whole, taking the place of
+  // the oldest answer item that only has held deltas.
   fallbackMessages(messages) {
     const flat = (t) => t.replace(/\s+/g, " ").trim();
     for (const msg of messages.filter(Boolean)) {
       if (flat(this.answer).includes(flat(msg))) continue;
-      const partial = [...this.textItems].find((id) => {
-        const shown = this.shown.get(id) ?? "";
-        return shown && !this.doneItems.has(id) && msg.startsWith(shown);
-      });
-      if (partial) {
-        this.text(msg.slice(this.shown.get(partial).length));
-        this.shown.set(partial, msg);
-        this.doneItems.add(partial);
-      } else {
-        this.text(this.answer && !/\s$/.test(this.answer) ? `\n\n${msg}` : msg);
-      }
+      const streamed = [...this.held.keys()].find((id) => this.held.get(id).kind === "text");
+      if (streamed) { this.held.delete(streamed); this.doneItems.add(streamed); }
+      this.text(this.answer && !/\s$/.test(this.answer) ? `\n\n${msg}` : msg);
     }
+  }
+  // Last resort, when no complete form of an item could be read (a stopped turn, the cloud
+  // unreachable): show its held deltas, possibly with gaps, rather than nothing.
+  flushHeld() {
+    for (const [id, h] of this.held) { this.doneItems.add(id); this.#emit(h.kind, h.text); }
+    this.held.clear();
   }
   // Cloud paths (/workspace/<repo>/...) -> paths in the local checkout.
   local(p) {
@@ -980,7 +989,7 @@ export class TurnState {
       case "turn/started": this.closeSetup(); return null;
       case "item/agentMessage/delta": this.#delta(p.itemId, p.delta, "text"); return null;
       case "item/reasoning/summaryTextDelta": this.#delta(p.itemId, p.delta, "thought"); return null;
-      case "item/reasoning/summaryPartAdded": if (this.shown.has(p.itemId)) this.#delta(p.itemId, "\n\n", "thought"); return null;
+      case "item/reasoning/summaryPartAdded": if (this.held.has(p.itemId)) this.#delta(p.itemId, "\n\n", "thought"); return null;
       case "item/started": this.itemStarted(p.item); return null;
       case "item/completed": this.itemCompleted(p.item); return null;
       case "turn/plan/updated": {
