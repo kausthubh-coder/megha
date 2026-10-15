@@ -38,8 +38,29 @@ Then check the megha path by running `node "<megha path>" --version`. It should 
 
 T3 Code keeps its settings in `~/.t3/userdata/settings.json` (`%USERPROFILE%\.t3\userdata\settings.json` on Windows).
 
+The safest way is this script: it finds both paths itself, backs the file up, and writes the two entries, so no path passes through a shell (shells, especially on Windows, drop backslashes). Save it to a temporary file named `megha-t3-setup.cjs` with your file-writing tool, run `node megha-t3-setup.cjs`, show the user its output, then delete the file.
+
+```js
+const fs = require("fs"), path = require("path"), os = require("os"), cp = require("child_process");
+const file = path.join(process.env.T3CODE_HOME || path.join(os.homedir(), ".t3"), "userdata", "settings.json");
+const megha = path.join(cp.execSync("npm root -g", { encoding: "utf8" }).trim(), "t3-megha", "index.mjs");
+if (!fs.existsSync(megha)) throw new Error("megha is not installed at " + megha);
+if (!fs.existsSync(file)) throw new Error("T3 Code settings not found at " + file);
+fs.copyFileSync(file, file + ".bak");
+const settings = JSON.parse(fs.readFileSync(file, "utf8"));
+settings.providerInstances = settings.providerInstances || {};
+for (const [id, backend, name] of [["megha-codex", "codex", "Codex Cloud"], ["megha-claude", "claude", "Claude Code on the web"]]) {
+  settings.providerInstances[id] = { driver: "acpRegistry", displayName: name, config: { source: "local", commandPath: process.execPath, commandArgs: [megha, "--backend", backend] } };
+}
+fs.writeFileSync(file + ".tmp", JSON.stringify(settings, null, 2));
+fs.renameSync(file + ".tmp", file);
+console.log("Added megha-codex and megha-claude to " + file + " (backup: settings.json.bak)");
+```
+
+If you can't run the script, edit the file by hand instead:
+
 1. Make a backup copy of the file next to it, for example `settings.json.bak`.
-2. Add these two entries to its `"providerInstances"` object. Create the object if it isn't there. Put the paths from step 4 in place of `<node path>` and `<megha path>`. In JSON, write each Windows backslash as `\\`.
+2. Add these two entries to its `"providerInstances"` object. Create the object if it isn't there. Put the paths from step 4 in place of `<node path>` and `<megha path>`. In JSON, write each Windows backslash as `\\`. Write the file with your file-editing tool, not a shell command.
 
 ```json
 {
