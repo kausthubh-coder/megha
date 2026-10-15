@@ -87,10 +87,17 @@ T3 on Windows refuses `.cmd` shims, so `commandPath` must be `node.exe` and the 
   settle, including the cloud's answer to the cancel, and is refused if it hasn't.
 - A turn that runs past megha's 3-hour limit is cancelled in the cloud the same way.
 - megha saves in its session record whether it has seen the cloud turn end. An accepted cancel
-  doesn't count, and neither does a prompt request whose answer never came. Until the cloud reports
-  the end, the next prompt, `/apply` or `/pr` checks the cloud first and is refused while the turn
-  still runs, also after a restart. `/status` shows the cloud's status and clears the wait once the
-  turn has ended.
+  doesn't count, and neither does a prompt request whose answer never came. Before every prompt,
+  `/apply` or `/pr`, megha reads the task or session from the cloud again, and what the cloud says
+  replaces the saved state in both directions: a turn started on the web or from another client
+  blocks the next prompt even if megha saw the last one end. Resume and `/status` read the cloud the
+  same way. A prompt is refused while a turn still runs.
+- A failed turn (Codex) or a Claude session whose container never started counts as ended. `/status`
+  and the automatic "Continue where you left off." say so and tell you to send a prompt to try again
+  or open it on the web.
+- When a local apply changes the checkout or leaves it needing recovery, megha saves the message
+  with the session before it shows it. If the turn was already stopped, or megha restarts, the
+  message shows at the start of the next prompt.
 - Loading or resuming a session in another folder checks it against that folder's repo again.
 - Cloud errors, including failed turns, show the operation, the HTTP status and a known error code.
   megha never shows or logs the cloud's own error text or the response body.
@@ -114,3 +121,17 @@ T3 on Windows refuses `.cmd` shims, so `commandPath` must be `node.exe` and the 
 - When T3 replaces the session for a thread (rollback), megha recognises the thread by a hash of T3's
   per-thread MCP credential and keeps using the same cloud task. Without that it starts a new task and
   says so.
+
+## Known limitations
+
+- If the request that creates a task or session times out and no id comes back, megha can't check
+  whether the cloud made it. Look on chatgpt.com/codex or claude.ai/code before you retry, because a
+  duplicate may already be running.
+- Claude reports no turn status of its own, so megha treats the worker going idle as the end of the
+  turn. The worker can also be idle while a message megha sent waits for a container to start.
+- If a Claude container reports a startup error but the session never reaches a failed status, megha
+  can't tell whether it will retry. It refuses new prompts until the cloud reports the session idle
+  or failed.
+- A local apply that already started may finish after you press Stop. If git's time limit kills a
+  `git apply --3way` partway, the checkout can be left partly changed. megha tells you which files and
+  gives the git commands to check them, but you have to fix them yourself.

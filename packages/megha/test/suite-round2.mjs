@@ -207,16 +207,17 @@ export async function run() {
   // ======================= 6. a deadline stops the cloud turn, and a retry waits for it =======================
   await test("R2-6 claude: the turn deadline interrupts the cloud session; a retry is refused until it stops", async () => {
     const repo = await makeRepo({ origin: null });
-    let running = true;
+    let running = true, started = false; // the worker runs once the first prompt is in
     const kinds = [];
     mockFetch(claudeBase([
       ["POST", /cse_r6\/events$/, (req) => {
         const k = claudeEventKind(req); kinds.push(k);
+        if (k === "user") started = true;
         if (k === "interrupt") return running ? json({ error: { type: "api_error" } }, 503) : json({ results: [] });
         return json({ results: [{ sequence_num: String(10 * kinds.length) }] });
       }],
       ["GET", /cse_r6\/events\/stream$/, (req) => (running ? keepaliveSse(req.signal) : sse([crow(500, { type: "result", subtype: "success", is_error: false })]))],
-      ["GET", /cse_r6$/, () => json({ session: { id: "cse_r6", worker_status: running ? "running" : "idle" } })],
+      ["GET", /cse_r6$/, () => json({ session: { id: "cse_r6", worker_status: running && started ? "running" : "idle" } })],
     ]));
     const a = new MeghaAgent(fakeConn(), new ClaudeBackend({ statusPollMs: 60_000, turnTimeoutMs: 300, stopWaitMs: 300 }), { env: {}, drainWaitMs: 5000 });
     const { sessionId } = await a.newSession({ cwd: repo, mcpServers: [] });
@@ -430,7 +431,7 @@ export async function run() {
 
     await test("C claude: Stop during a stalled ls-remote in /apply doesn't block the next prompt", async () => {
       const repo = await makeRepo({ origin: hangUrl });
-      mockFetch(claudeBase());
+      mockFetch(claudeBase([["GET", /cse_rc$/, () => json({ session: { id: "cse_rc", worker_status: "idle" } })]]));
       const a = new MeghaAgent(fakeConn(), new ClaudeBackend({ statusPollMs: 60_000 }), { env: {}, drainWaitMs: 4000 });
       const { sessionId } = await a.newSession({ cwd: repo, mcpServers: [] });
       Object.assign(a.sessions.get(sessionId), { cloudId: "cse_rc", bundle: false, outcomeBranch: "claude/rc", baseBranch: "main", repoChecked: true, cloudState: "idle", webUrl: "https://claude.ai/code/cse_rc" });

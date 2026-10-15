@@ -130,6 +130,7 @@ export function recorder({ signal } = {}) {
       signal: turn.signal,
       update: record,
       text: (t) => record({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: t } }),
+      notice: (t) => record({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `\n\n${t}` } }), // a live, unmuted turn shows it at once
       requestPermission: async (p) => { acpCaptured.push(p); return { outcome: { outcome: "selected", optionId: "allow" } }; },
     },
   };

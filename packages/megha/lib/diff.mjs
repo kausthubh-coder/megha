@@ -86,6 +86,14 @@ export function diffToolCall({ toolCallId, diff, cwd, title }) {
   };
 }
 
+// Say what applyLocally did. A result that touched the checkout goes out as a notice (io.notice, see
+// addNotice in lib/util.mjs): saved with the session, shown now if the turn can still talk, otherwise
+// at the next prompt, even after a restart. `lead` goes before a plain message only.
+export function reportApply(io, r, { lead = "" } = {}) {
+  if (r.attention) io.notice(r.message);
+  else io.text(`${lead}${r.message}`);
+}
+
 function savePatch(name, diff) {
   const dir = join(DATA_DIR, "patches");
   mkdirSync(dir, { recursive: true });
@@ -110,6 +118,10 @@ function savePatch(name, diff) {
 // the result says so, with the saved patch files and the exact commands to recover; a Stop that hits
 // such a failure throws RecoveryNeeded (shown to the user) instead of Cancelled. `run` replaces git
 // in tests.
+//
+// `attention: true` on a result: the checkout was changed, or may have been (applied, applied with
+// conflicts, partly applied, a previous diff that could not be put back). Report it with reportApply,
+// never only as turn text: the turn may have been stopped and muted by the time git returns.
 export async function applyLocally({ cwd, diff, name, previousFile, signal, run = git }) {
   const read = (dir, args) => { throwIfCancelled(signal); return run(dir, args, { signal }); };
   const change = (dir, args) => { throwIfCancelled(signal); return run(dir, args); };
@@ -148,7 +160,7 @@ export async function applyLocally({ cwd, diff, name, previousFile, signal, run 
       const { outcome } = await step(["apply", "-R", file], file);
       if (outcome === "done") prevFile = file;
       else if (outcome === "partial") {
-        return { ok: false, message: `Not applied: undoing the cloud diff applied before was stopped by its time limit partway through, so the files it touches (${diffFiles(previous).map((f) => f.path).slice(0, 8).join(", ")}) are partly changed. Saved patches: the earlier diff is ${file}, the new one ${patchFile}. See what changed with ${cmd("diff")}. Once those files are as you want them, ${cmd(`apply --check "${patchFile}"`)} shows whether the new diff applies.` };
+        return { ok: false, attention: true, message: `Not applied: undoing the cloud diff applied before was stopped by its time limit partway through, so the files it touches (${diffFiles(previous).map((f) => f.path).slice(0, 8).join(", ")}) are partly changed. Saved patches: the earlier diff is ${file}, the new one ${patchFile}. See what changed with ${cmd("diff")}. Once those files are as you want them, ${cmd(`apply --check "${patchFile}"`)} shows whether the new diff applies.` };
       }
     } else {
       log("previous diff no longer reverses cleanly; applying the new diff on top");
@@ -170,16 +182,16 @@ export async function applyLocally({ cwd, diff, name, previousFile, signal, run 
 
   try {
     const swapped = prevFile ? ", replacing the previously applied diff" : "";
-    const applied = (how) => ({ ok: true, patchFile, message: `Applied the cloud diff ${how} (${n} file${n === 1 ? "" : "s"}${swapped}).` });
+    const applied = (how) => ({ ok: true, attention: true, patchFile, message: `Applied the cloud diff ${how} (${n} file${n === 1 ? "" : "s"}${swapped}).` });
     const check = await read(root, ["apply", "--check", patchFile]);
     if (check.code === 0) {
       // Applies cleanly: a plain apply touches only the working tree (no index changes).
       const { res, outcome } = await step(["apply", patchFile], patchFile);
       if (outcome === "done") return applied("to your working tree");
-      if (outcome === "partial") return { ok: false, message: partlyApplied("`git apply` of the cloud diff") };
+      if (outcome === "partial") return { ok: false, attention: true, message: partlyApplied("`git apply` of the cloud diff") };
       if (res.timedOut) {
         const failed = await restore();
-        if (failed) return { ok: false, message: `Not applied: \`git apply\` was stopped by its time limit before it changed anything, and ${failed}` };
+        if (failed) return { ok: false, attention: true, message: `Not applied: \`git apply\` was stopped by its time limit before it changed anything, and ${failed}` };
         return { ok: false, message: `Not applied: \`git apply\` did not finish within its time limit and was stopped before it changed anything. Nothing was changed. Patch saved to ${patchFile}.` };
       }
     }
@@ -190,16 +202,16 @@ export async function applyLocally({ cwd, diff, name, previousFile, signal, run 
     if (!dirty) {
       const res = await change(root, ["apply", "--3way", patchFile]);
       // A 3-way apply works file by file through the index; one the timeout killed can't be probed.
-      if (res.timedOut) return { ok: false, message: partlyApplied("`git apply --3way` of the cloud diff") };
+      if (res.timedOut) return { ok: false, attention: true, message: partlyApplied("`git apply --3way` of the cloud diff") };
       const conflicted = [...res.stderr.matchAll(/Applied patch to '([^']+)' with conflicts/g)].map((m) => m[1]);
       if (res.code === 0) return applied("with a 3-way merge");
       if (conflicted.length) {
-        return { ok: false, message: `Applied with conflicts in ${conflicted.join(", ")}: resolve the conflict markers there (the changes are staged by git apply --3way). Patch saved to ${patchFile}.` };
+        return { ok: false, attention: true, message: `Applied with conflicts in ${conflicted.join(", ")}: resolve the conflict markers there (the changes are staged by git apply --3way). Patch saved to ${patchFile}.` };
       }
     }
     const why = `the cloud diff does not apply cleanly${failing.length ? ` (${failing.slice(0, 8).join(", ")})` : ""}${dirty ? " and the touched files have local edits" : ""}`;
     const failed = await restore();
-    if (failed) return { ok: false, message: `Not applied: ${why}, and ${failed}` };
+    if (failed) return { ok: false, attention: true, message: `Not applied: ${why}, and ${failed}` };
     return { ok: false, message: `Not applied: ${why}. Nothing was changed. Patch saved to ${patchFile}.` };
   } catch (e) {
     // Only reads and the checks before a change throw here, so the new diff was not applied: undo the

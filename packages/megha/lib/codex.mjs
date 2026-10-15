@@ -5,12 +5,12 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, posix } from "node:path";
 import {
-  log, sleep, sseFrames, tail, repoInfo, UserError, isoFromEpochSeconds, saveSessionRecord, cleanTerminal,
+  log, sleep, sseFrames, tail, git, repoInfo, UserError, isoFromEpochSeconds, saveSessionRecord, cleanTerminal,
   cachedList, readCache, writeCache, localChanges, localPatch, setupCommandsFor, findPullRequestUrl,
   CloudError, operationLabel, parseJsonBody, throwIfCancelled, boundedSignal, Cancelled, describeError, turnFailed,
-  cloudStateOf, setCloudState, startCloudTurn, stillRunningText,
+  cloudStateOf, setCloudState, startCloudTurn, stillRunningText, classifyCloud, applyReading, hasEnded, failedText,
 } from "./util.mjs";
-import { codexChangesToPatch, diffToolCall, applyLocally, diffFiles } from "./diff.mjs";
+import { codexChangesToPatch, diffToolCall, applyLocally, reportApply, diffFiles } from "./diff.mjs";
 import { imageSize, imageExtension } from "./image.mjs";
 import { linkPullRequest } from "./t3mcp.mjs";
 import { VERSION } from "./version.mjs";
@@ -18,6 +18,8 @@ import { VERSION } from "./version.mjs";
 const BASE = (process.env.CODEX_CLOUD_TASKS_BASE_URL || "https://chatgpt.com/backend-api").replace(/\/+$/, "");
 const WEB = BASE.replace(/\/backend-api$/, "");
 const USER_AGENT = `megha/${VERSION} (ACP agent for Codex Cloud)`;
+// megha's own result statuses for a turn that ended (#streamTurn, TurnState.handle). What a cloud
+// response says about a turn is classifyCloud's job (lib/util.mjs), not this set's.
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 const POLL_MS = 5000;
 const CLIENT_VERSION = "0.162.1"; // the Codex CLI version the model list is requested for
@@ -206,9 +208,10 @@ export class CodexBackend {
 
   // pollMs: how often a running turn is polled; turnTimeoutMs: the hard limit for one turn, after
   // which megha cancels it in the cloud; stopWaitMs: how long a stopped turn (Stop or the limit) is
-  // watched for its terminal status. Tests shorten them.
-  constructor({ pollMs = POLL_MS, turnTimeoutMs = 3 * 3600_000, stopWaitMs = 30_000 } = {}) {
-    Object.assign(this, { pollMs, turnTimeoutMs, stopWaitMs });
+  // watched for its terminal status. Tests shorten them. applyGit: the git runner for the local apply
+  // (lib/diff.mjs `run`); tests replace it to replay a git apply killed by its timeout.
+  constructor({ pollMs = POLL_MS, turnTimeoutMs = 3 * 3600_000, stopWaitMs = 30_000, applyGit = git } = {}) {
+    Object.assign(this, { pollMs, turnTimeoutMs, stopWaitMs, applyGit });
   }
 
   checkAuth() { readAuth(); }
@@ -260,9 +263,19 @@ export class CodexBackend {
     session.repo ??= await repoInfo(session.cwd);
     const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`);
     this.#checkTask(session, d);
-    // A terminal turn seen here is an observed end. Not saved on its own: if megha stops before the
-    // next save, the record keeps the older state and is simply checked again.
-    if (TERMINAL.has(d?.current_assistant_turn?.turn_status)) session.cloudState = "idle";
+    // Resume reconciles: what the cloud says now replaces the saved state, in both directions (a task
+    // saved idle may have been continued on chatgpt.com since).
+    applyReading(session, this.#read(session, d));
+  }
+
+  // classifyCloud (lib/util.mjs) for a GET /wham/tasks/{id} answer, plus one case megha knows better:
+  // a nonterminal status on the very turn megha itself saw end (doneTurnId is set only from an
+  // observed end) is the task's status lagging its turn/completed event. A turn started anywhere else
+  // (chatgpt.com, another client) has a new id, so it always counts.
+  #read(session, d) {
+    const reading = classifyCloud("codex", d);
+    const id = d?.current_assistant_turn?.id;
+    return reading === "running" && id && id === session.doneTurnId ? "idle" : reading;
   }
 
   // true when Codex Cloud accepted the cancel. Never throws.
@@ -277,17 +290,18 @@ export class CodexBackend {
     await this.#cancelTask(session);
   }
 
-  // Before any mutation (a follow-up, /apply, /pr): unless megha saw the task's last turn end
-  // (cloudState idle, lib/util.mjs), look at the task now. Only a terminal turn_status counts as
-  // ended; in progress, pending or no status at all is refused rather than overlapped, and a turn
-  // megha had asked to stop is asked again. `details`: a GET /wham/tasks/{id} answer just fetched.
+  // Before any mutation (a follow-up, /apply, /pr): read the task now, whatever the saved state says,
+  // and take that reading over it (applyReading). Ended (idle or failed) goes ahead; running, pending
+  // or no status at all is refused rather than overlapped, and a turn megha had asked to stop is asked
+  // again. `details`: a GET /wham/tasks/{id} answer just fetched (every caller has one; it is the
+  // cheap GET). Returns the reading.
   async #reconcile(session, signal, details = null) {
-    const state = cloudStateOf(session);
-    if (state === "idle") return;
     const d = details ?? await api("GET", `/wham/tasks/${enc(session.cloudId)}`, undefined, { signal });
-    if (TERMINAL.has(d?.current_assistant_turn?.turn_status)) { setCloudState(session, "idle"); return; }
+    const reading = applyReading(session, this.#read(session, d));
+    if (hasEnded(reading)) return reading;
+    const state = cloudStateOf(session);
     const again = state === "stop_requested" ? await this.#cancelTask(session) : undefined;
-    log(`previous turn not seen to end (${state}); refusing`);
+    log(`previous turn not seen to end (${state}, cloud ${reading}); refusing`);
     throw new UserError(stillRunningText(LABEL, session.webUrl ?? taskUrl(session.cloudId), again));
   }
 
@@ -533,12 +547,12 @@ export class CodexBackend {
     if (!turn?.id) return null;
     session.title = d.task?.title ?? session.title;
     session.webUrl ??= taskUrl(session.cloudId);
-    if (!TERMINAL.has(turn.turn_status)) {
+    const reading = applyReading(session, this.#read(session, d));
+    if (!hasEnded(reading)) {
       log(`reattaching to running turn ${turn.id}`);
       session.turnId = turn.id;
       return this.#afterTurn(session, await this.#streamTurn(session, turn.id, io), io);
     }
-    setCloudState(session, "idle"); // seen ended
     if (turn.id === session.doneTurnId) return null;
     log(`showing turn ${turn.id} that finished while detached`);
     session.turnId = turn.id;
@@ -557,7 +571,9 @@ export class CodexBackend {
     if (result.status === "completed" && !io.signal.aborted) {
       try { await this.#finishDiff(session, io); } catch (e) { if (!(e instanceof Cancelled)) throw e; }
     }
-    if (TERMINAL.has(result.status)) session.doneTurnId = session.turnId;
+    // doneTurnId means "megha saw this turn end" (#read relies on it), so only an observed end sets it:
+    // a stop whose end was never seen leaves the state stop_requested, not idle.
+    if (TERMINAL.has(result.status) && cloudStateOf(session) === "idle") session.doneTurnId = session.turnId;
     io.text(`\n\n[Open in Codex Cloud](${session.webUrl})`);
     saveSessionRecord(session);
     if (result.status === "cancelled" || io.signal.aborted) return "cancelled";
@@ -646,7 +662,7 @@ export class CodexBackend {
           const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`, undefined, { signal: ac.signal });
           session.title = d.task?.title ?? session.title;
           const turn = d.current_assistant_turn;
-          if (turn?.id === turnId && TERMINAL.has(turn.turn_status)) {
+          if (turn?.id === turnId && hasEnded(classifyCloud("codex", d))) {
             // Give the stream a moment to deliver the tail, then fill gaps from the stored events.
             await sleep(1500, ac.signal);
             if (finished) return;
@@ -701,9 +717,10 @@ export class CodexBackend {
     const n = diffFiles(diff).length;
     if (session.config.apply === "on") {
       throwIfCancelled(io.signal);
-      const r = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${session.turnId.split("~").pop()}`, previousFile: session.appliedPatchFile, signal: io.signal });
+      const r = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${session.turnId.split("~").pop()}`, previousFile: session.appliedPatchFile, signal: io.signal, run: this.applyGit });
       if (r.ok && !r.unchanged) session.appliedPatchFile = r.patchFile;
-      io.text(`\n\n${r.message} Type /pr to open a pull request.`);
+      reportApply(io, r, { lead: "\n\n" });
+      io.text(" Type /pr to open a pull request.");
     } else {
       io.text(`\n\nThe cloud produced a diff (${n} file${n === 1 ? "" : "s"}). Type /apply to apply it here, or /pr to open a pull request.`);
     }
@@ -719,16 +736,17 @@ export class CodexBackend {
         const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`, undefined, { signal: io.signal });
         this.#checkTask(session, d);
         const t = d.current_assistant_turn ?? {};
-        // /status is how a user clears a refused prompt: a terminal turn seen here counts as the end.
-        if (TERMINAL.has(t.turn_status)) setCloudState(session, "idle");
+        // /status shows the cloud's word and takes it over the saved state, either way.
+        const reading = applyReading(session, this.#read(session, d));
         const disp = d.task?.task_status_display ?? {};
         const st = disp.latest_turn_status_display?.diff_stats;
         io.text([`**${d.task?.title ?? "Cloud task"}**`, `Status: ${t.turn_status ?? disp.latest_turn_status_display?.turn_status ?? "unknown"}`,
           `Environment: ${disp.environment_label ?? session.config.environment}`, `Branch: ${disp.branch_name ?? t.branch ?? "?"}`,
           `Model: ${t.model_version ?? session.config.model}`, ...(st ? [`Diff: ${st.files_modified ?? 0} files (+${st.lines_added ?? 0} -${st.lines_removed ?? 0})`] : []),
           ...(session.prUrl ? [`Pull request: ${session.prUrl}`] : []),
+          ...(reading === "failed" ? [failedText("The last turn failed.", session.webUrl ?? taskUrl(session.cloudId))] : []),
           ...(cloudStateOf(session) === "idle" ? [] : ["megha hasn't seen the last turn end yet, so new prompts wait until it does."]),
-          `[Open in Codex Cloud](${session.webUrl})`].join("\n"));
+          `[Open in Codex Cloud](${session.webUrl ?? taskUrl(session.cloudId)})`].join("\n"));
         return;
       }
       case "apply": {
@@ -737,10 +755,10 @@ export class CodexBackend {
         await this.#reconcile(session, io.signal, details);
         if (!diff) { io.text("The cloud task has no diff to apply yet."); return; }
         throwIfCancelled(io.signal);
-        const r = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${String(turnId).split("~").pop()}`, previousFile: session.appliedPatchFile, signal: io.signal });
+        const r = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${String(turnId).split("~").pop()}`, previousFile: session.appliedPatchFile, signal: io.signal, run: this.applyGit });
         if (r.ok && !r.unchanged) session.appliedPatchFile = r.patchFile;
         saveSessionRecord(session);
-        io.text(r.message);
+        reportApply(io, r);
         return;
       }
       case "pr": {
@@ -840,7 +858,7 @@ export class CodexBackend {
       const diff = turnDiff(turn);
       if (diff) updates.push(diffToolCall({ toolCallId: `diff:${node.id}`, diff, cwd: session.cwd }));
       session.turnId = node.id;
-      if (TERMINAL.has(turn.turn_status)) session.doneTurnId = node.id;
+      if (hasEnded(classifyCloud("codex", { current_assistant_turn: turn }))) session.doneTurnId = node.id;
     }
     if (session.title) updates.push({ sessionUpdate: "session_info_update", title: session.title });
     for (const u of updates) io.update(u);

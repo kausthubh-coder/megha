@@ -11,9 +11,9 @@ import crypto from "node:crypto";
 import {
   log, sleep, sseFrames, tail, git, repoInfo, UserError, saveSessionRecord, allSessionRecords, cleanTerminal, cachedList, localChanges,
   CloudError, operationLabel, parseJsonBody, throwIfCancelled, boundedSignal, Cancelled, describeError, turnFailed, provenanceOf,
-  GIT_NETWORK_TIMEOUT_MS, samePath, cloudStateOf, setCloudState, startCloudTurn, stillRunningText,
+  GIT_NETWORK_TIMEOUT_MS, samePath, cloudStateOf, setCloudState, startCloudTurn, stillRunningText, classifyCloud, applyReading, hasEnded, failedText,
 } from "./util.mjs";
-import { diffToolCall, applyLocally, diffFiles } from "./diff.mjs";
+import { diffToolCall, applyLocally, reportApply, diffFiles } from "./diff.mjs";
 
 const BASE = (process.env.CLAUDE_CLOUD_BASE_URL || "https://api.anthropic.com").replace(/\/+$/, "");
 const CC_VERSION = "2.1.288";
@@ -218,7 +218,7 @@ function sessionRepo(s) {
 }
 const fullName = (repo) => (repo?.github ? `${repo.github.owner}/${repo.github.name}`.toLowerCase() : null);
 // Shown when the container never comes up. last_init_error itself is server text and is never shown.
-const STARTUP_FAILED = "Claude could not start the cloud session's container; open the session on claude.ai to see why.";
+const startupFailed = (url) => failedText("Claude could not start the cloud session's container.", url);
 // Claude Code SDK result subtypes named in megha's failure message. result.result is the cloud's own
 // text (it can quote tool output or env vars) and is never shown.
 const RESULT_ERRORS = {
@@ -246,9 +246,10 @@ export class ClaudeBackend {
   // the hard limit for one turn; idleMs: reconnect a stream that sends no bytes (not even keepalives)
   // for this long. Tests shorten them.
   // stopWaitMs: how long a stopped turn (Stop or the limit) is watched for its result after megha
-  // sends the interrupt.
-  constructor({ statusPollMs = 15_000, turnTimeoutMs = 3 * 3600_000, idleMs = 120_000, stopWaitMs = 30_000 } = {}) {
-    Object.assign(this, { statusPollMs, turnTimeoutMs, idleMs, stopWaitMs });
+  // sends the interrupt. settleMs: the pause between re-reads in #reconcile right after a watched end.
+  // applyGit: the git runner for the local apply (lib/diff.mjs `run`; tests).
+  constructor({ statusPollMs = 15_000, turnTimeoutMs = 3 * 3600_000, idleMs = 120_000, stopWaitMs = 30_000, settleMs = 1000, applyGit = git } = {}) {
+    Object.assign(this, { statusPollMs, turnTimeoutMs, idleMs, stopWaitMs, settleMs, applyGit });
   }
 
   checkAuth() { readCredentials(); }
@@ -357,9 +358,9 @@ export class ClaudeBackend {
     this.#checkSession(session, s);
     this.#hydrate(session, s);
     session.lastInitError = s.external_metadata?.last_init_error ?? null;
-    // An idle worker seen here is an observed end of the last turn. Not saved on its own: if megha
-    // stops before the next save, the record keeps the older state and is simply checked again.
-    if (s.worker_status === "idle") session.cloudState = "idle";
+    // Resume reconciles: what the cloud says now replaces the saved state, in both directions (a
+    // session saved idle may have a turn started on claude.ai; one saved unknown may have failed).
+    applyReading(session, classifyCloud("claude", s));
     return s;
   }
 
@@ -393,17 +394,27 @@ export class ClaudeBackend {
     await this.#interruptQuietly(session);
   }
 
-  // Before any mutation (a prompt, /apply): unless megha saw the session's last turn end (cloudState
-  // idle, lib/util.mjs), look at the session now. Only worker_status "idle" counts as ended; running,
-  // requires_action or no status at all is refused rather than overlapped, and a turn megha had asked
-  // to stop is asked again. `known`: a session object just fetched, to save a GET.
+  // Before any mutation (a prompt, /apply): always read the session now (a cached idle can be stale:
+  // claude.ai or another client may have started a turn since), and take that reading over the saved
+  // state (applyReading). Ended (idle, or failed: the retry the failure message offers) goes ahead;
+  // running, requires_action or no status at all is refused rather than overlapped, and a turn megha
+  // had asked to stop is asked again. `known`: a session object just fetched, to save a GET.
+  //
+  // Right after megha itself saw a turn's result, the worker may still read "running" for a moment;
+  // only then is the session read again a few times (settleMs apart) before the prompt is refused.
   async #reconcile(session, signal, known = null) {
+    const get = async () => unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal }));
+    let reading = classifyCloud("claude", known ?? await get());
+    for (let i = 0; i < 3 && reading === "running" && Date.now() - (session.watchedEndAt ?? 0) < 30_000; i++) {
+      await sleep(this.settleMs, signal);
+      throwIfCancelled(signal);
+      reading = classifyCloud("claude", await get());
+    }
+    applyReading(session, reading);
+    if (hasEnded(reading)) return reading;
     const state = cloudStateOf(session);
-    if (state === "idle") return;
-    const s = known ?? unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal }));
-    if (s.worker_status === "idle") { setCloudState(session, "idle"); return; }
     const again = state === "stop_requested" ? await this.#interruptQuietly(session) : undefined;
-    log(`previous turn not seen to end (${state}, worker ${["running", "requires_action"].includes(s.worker_status) ? s.worker_status : "status unknown"}); refusing`);
+    log(`previous turn not seen to end (${state}, cloud ${reading}); refusing`);
     throw new UserError(stillRunningText(LABEL, session.webUrl ?? this.webUrl(session.cloudId), again));
   }
 
@@ -468,16 +479,17 @@ export class ClaudeBackend {
     const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal: io.signal }));
     this.#checkSession(session, s);
     session.webUrl ??= this.webUrl(session.cloudId);
-    let pending = s.worker_status === "running" || s.worker_status === "requires_action";
+    const reading = applyReading(session, classifyCloud("claude", s));
+    // A session whose container never started has nothing to continue: say so and how to go on, and
+    // send nothing (the user's own next prompt is the retry).
+    if (reading === "failed") { io.text(startupFailed(session.webUrl)); return "end_turn"; }
+    let pending = reading === "running";
     if (!pending) {
       const j = await api("GET", `/v1/code/sessions/${enc(session.cloudId)}/events`, { query: { sort_order: "asc", cursor: session.lastSeq ?? 0, limit: 500 }, signal: io.signal });
       pending = (j.data ?? []).some((row) => row.payload?.type === "result" && !row.payload.parent_tool_use_id && Number(row.sequence_num) > (session.lastSeq ?? 0));
       if (pending) io.text("The cloud turn finished while T3 Code was away. Its result:\n\n");
     }
-    if (!pending) {
-      if (s.worker_status === "idle") setCloudState(session, "idle"); // seen ended: the follow-up needn't ask again
-      return null;
-    }
+    if (!pending) return null;
     log(`reattaching from sequence ${session.lastSeq ?? 0}`);
     return this.#afterTurn(session, await this.#streamTurn(session, io, session.lastSeq ?? 0, 0), io);
   }
@@ -593,7 +605,7 @@ export class ClaudeBackend {
       if (finished) return;
       finished = r;
       io.turn.closePermissions();
-      if (r.observed) setCloudState(session, "idle");
+      if (r.observed) { setCloudState(session, "idle"); session.watchedEndAt = Date.now(); } // see #reconcile
       ac.abort();
     };
     const timers = [];
@@ -626,12 +638,13 @@ export class ClaudeBackend {
           const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal: ac.signal }));
           const initError = s.external_metadata?.last_init_error || null;
           if (session.lastInitError === undefined) { session.lastInitError = initError; continue; } // no baseline yet
-          if (s.status === "failed" || (initError && initError !== session.lastInitError)) {
+          const failed = classifyCloud("claude", s) === "failed";
+          if (failed || (initError && initError !== session.lastInitError)) {
             session.lastInitError = initError;
             log("the cloud session failed to start");
             // A failed session is an end the cloud reported; a new startup error alone is not (the
             // container may retry), so that one is checked again before the next prompt.
-            finish({ status: "failed", error: turnFailed(LABEL, { guidance: STARTUP_FAILED }), observed: s.status === "failed" });
+            finish({ status: "failed", error: turnFailed(LABEL, { guidance: startupFailed(session.webUrl ?? this.webUrl(session.cloudId)) }), observed: failed });
             return;
           }
         } catch (e) {
@@ -773,9 +786,9 @@ export class ClaudeBackend {
     const compare = this.#compare(session);
     if (session.config.apply === "on") {
       throwIfCancelled(io.signal);
-      const a = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${session.lastSeq}`, previousFile: session.appliedPatchFile, signal: io.signal });
+      const a = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${session.lastSeq}`, previousFile: session.appliedPatchFile, signal: io.signal, run: this.applyGit });
       if (a.ok && !a.unchanged) session.appliedPatchFile = a.patchFile;
-      io.text(`\n\n${a.message}`);
+      reportApply(io, a, { lead: "\n\n" });
     } else {
       io.text(`\n\nThe session pushed \`${session.outcomeBranch}\` (fetched as origin/${session.outcomeBranch}). Type /apply to apply it here.`);
     }
@@ -791,13 +804,14 @@ export class ClaudeBackend {
       case "status": {
         const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal: io.signal }));
         this.#checkSession(session, s);
-        // /status is how a user clears a refused prompt: an idle worker seen here counts as the end.
-        if (s.worker_status === "idle") setCloudState(session, "idle");
-        io.text([`**${s.title ?? session.title ?? "Cloud session"}**`, `Status: ${s.worker_status ?? s.status ?? "unknown"}`,
+        // /status shows the cloud's word and takes it over the saved state, either way.
+        const reading = applyReading(session, classifyCloud("claude", s));
+        io.text([`**${s.title ?? session.title ?? "Cloud session"}**`, `Status: ${reading === "failed" ? "failed" : s.worker_status ?? s.status ?? "unknown"}`,
           `Model: ${s.config?.model ?? session.config.model}`, `Permission mode: ${s.config?.permission_mode ?? session.config.mode}`,
           session.bundle ? "Source: git bundle (can't push a branch)" : `Branch: ${session.outcomeBranch ?? "?"}`,
+          ...(reading === "failed" ? [startupFailed(session.webUrl ?? this.webUrl(session.cloudId))] : []),
           ...(cloudStateOf(session) === "idle" ? [] : ["megha hasn't seen the last turn end yet, so new prompts wait until it does."]),
-          `[Open in Claude Code on the web](${session.webUrl})`].join("\n"));
+          `[Open in Claude Code on the web](${session.webUrl ?? this.webUrl(session.cloudId)})`].join("\n"));
         return;
       }
       case "apply": {
@@ -809,10 +823,10 @@ export class ClaudeBackend {
         if (r.reason === "no-base") { io.text(this.#noBaseText(session, r)); return; }
         if (!r.diff?.trim()) { io.text(r.reason === "fetch" ? this.#fetchFailedText(session) : this.#notPushedText(session)); return; }
         throwIfCancelled(io.signal);
-        const a = await applyLocally({ cwd: session.cwd, diff: r.diff, name: `${session.cloudId}-${session.lastSeq}`, previousFile: session.appliedPatchFile, signal: io.signal });
+        const a = await applyLocally({ cwd: session.cwd, diff: r.diff, name: `${session.cloudId}-${session.lastSeq}`, previousFile: session.appliedPatchFile, signal: io.signal, run: this.applyGit });
         if (a.ok && !a.unchanged) session.appliedPatchFile = a.patchFile;
         saveSessionRecord(session);
-        io.text(a.message);
+        reportApply(io, a);
         return;
       }
       case "pr": {

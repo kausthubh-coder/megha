@@ -107,12 +107,12 @@ export async function run() {
 
   await test("R3-1 claude: an acknowledged interrupt with the session still running doesn't let a retry send another prompt", async () => {
     const repo = await makeRepo({ origin: null });
-    let running = true;
+    let running = true, started = false; // the worker runs once the first prompt is in
     const kinds = [];
     mockFetch(claudeBase([
-      ["POST", /cse_r31\/events$/, (req) => { const k = claudeEventKind(req); kinds.push(k); return json({ results: [{ sequence_num: String(10 * kinds.length) }] }); }],
+      ["POST", /cse_r31\/events$/, (req) => { const k = claudeEventKind(req); kinds.push(k); if (k === "user") started = true; return json({ results: [{ sequence_num: String(10 * kinds.length) }] }); }],
       ["GET", /cse_r31\/events\/stream$/, (req) => (running ? keepaliveSse(req.signal) : sse([crow(500, { type: "result", subtype: "success", is_error: false })]))],
-      ["GET", /cse_r31$/, () => json({ session: { id: "cse_r31", worker_status: running ? "running" : "idle" } })],
+      ["GET", /cse_r31$/, () => json({ session: { id: "cse_r31", worker_status: running && started ? "running" : "idle" } })],
     ]));
     const a = new MeghaAgent(fakeConn(), new ClaudeBackend({ statusPollMs: 60_000, stopWaitMs: 300 }), { env: {}, drainWaitMs: 5000 });
     const { sessionId } = await a.newSession({ cwd: repo, mcpServers: [] });

@@ -64,7 +64,7 @@ export function operationLabel(method, path) {
 // travel: the cloud's own error text (Codex turn.error.message and stream `error` events, Claude
 // result.result) can quote env vars, tokens or tool output.
 export function turnFailed(label, { code = null, guidance = null, url = null } = {}) {
-  return new CloudError({ label, operation: "turn", code, guidance: guidance ?? `Open it in the cloud to see why${url ? `: ${url}` : "."}` });
+  return new CloudError({ label, operation: "turn", code, guidance: guidance ?? failedText("", url) });
 }
 
 // The one way megha turns any caught error into text for stderr or for the ACP error T3 shows. Only
@@ -187,7 +187,26 @@ export function allSessionRecords(backend) {
   return readAll(SESSIONS_DIR).filter((s) => s.backend === backend);
 }
 const PERSISTED_KEYS = ["id", "backend", "cwd", "cloudId", "cloudState", "turnId", "doneTurnId", "lastSeq", "title", "webUrl", "config", "bundle",
-  "outcomeBranch", "baseBranch", "baseSha", "appliedPatchFile", "sentMode", "sentModel", "prUrl", "createdAt", "updatedAt"];
+  "outcomeBranch", "baseBranch", "baseSha", "appliedPatchFile", "sentMode", "sentModel", "prUrl", "notices", "createdAt", "updatedAt"];
+
+// ---------- notices: what the user must see about their checkout ----------
+// A local apply that changed the checkout, or left it needing recovery, must reach the user even when
+// the turn that did it was stopped and T3 already has its answer (the turn's io is muted then), and
+// even if megha restarts before the next prompt. So such messages are notices: saved with the session
+// record first, then shown by the agent (lib/agent.mjs) at once if the turn can still talk, otherwise
+// at the start of the session's next prompt, and removed once shown.
+export function addNotice(session, text) {
+  session.notices = [...(session.notices ?? []), String(text)];
+  try { saveSessionRecord(session); } catch (e) { log(`session save failed: ${describeError(e)}`); }
+}
+// The session's notices, removed from it (and from its record).
+export function takeNotices(session) {
+  const list = session.notices ?? [];
+  if (!list.length) return [];
+  session.notices = [];
+  try { saveSessionRecord(session); } catch (e) { log(`session save failed: ${describeError(e)}`); }
+  return list;
+}
 
 // ---------- the session's cloud turn state ----------
 // What megha knows about the cloud task's (Codex) or session's (Claude) current turn:
@@ -198,10 +217,48 @@ const PERSISTED_KEYS = ["id", "backend", "cwd", "cloudId", "cloudState", "turnId
 //   unknown         megha can't tell: a turn-starting request whose answer never came (it may have
 //                   been taken), or a session megha never watched (bound from a cloud id, or a
 //                   record from before this field)
-// Only an observed terminal status moves it to idle. It is saved with the session record at every
-// change, so a restarted megha sees it. Every mutation (prompt, follow-up, apply, PR) checks the cloud
-// first unless the state is idle (each backend's #reconcile).
+// Only an observed end moves it to idle. It is saved with the session record at every change, so a
+// restarted megha sees it. A fresh cloud response always wins over it, in both directions (see
+// applyReading): resume reads the cloud, and every mutation (prompt, follow-up, apply, PR) reads it
+// again first (each backend's #reconcile).
 export const CLOUD_STATES = ["idle", "running", "stop_requested", "unknown"];
+
+// The one place megha decides what a cloud response says about the current turn. The live pollers,
+// resume, the check before a mutation, auto-continue and /status all go through it.
+//   idle     ended. Codex: turn_status completed or cancelled. Claude: worker_status idle.
+//   failed   ended in failure; nothing is running. Codex: turn_status failed. Claude: session status
+//            "failed" (its container never started), whatever worker_status still says.
+//   running  a turn is going on. Codex: any other turn_status (pending, in_progress, ...). Claude:
+//            worker_status running or requires_action.
+//   unknown  the response doesn't say: no turn or no status. A Claude last_init_error with no
+//            terminal status is this too (the container may still retry).
+// `r`: GET /wham/tasks/{id} (Codex) or the unwrapped GET /v1/code/sessions/{id} (Claude).
+export function classifyCloud(backend, r) {
+  if (backend === "codex") {
+    const status = r?.current_assistant_turn?.turn_status;
+    if (status === "completed" || status === "cancelled") return "idle";
+    if (status === "failed") return "failed";
+    return typeof status === "string" && status ? "running" : "unknown";
+  }
+  if (backend === "claude") {
+    if (r?.status === "failed") return "failed";
+    if (r?.worker_status === "running" || r?.worker_status === "requires_action") return "running";
+    if (r?.worker_status === "idle") return "idle";
+    return "unknown";
+  }
+  throw new Error(`unknown backend ${backend}`);
+}
+export const hasEnded = (reading) => reading === "idle" || reading === "failed";
+// Take a fresh reading over the saved state, in both directions: an ended turn makes the session idle,
+// and a running or unknown one makes an idle session running or unknown again (a turn started on the
+// web or from another client). A stop megha asked for stays stop_requested until the end is seen.
+export function applyReading(session, reading) {
+  if (hasEnded(reading)) setCloudState(session, "idle");
+  else if (cloudStateOf(session) !== "stop_requested") setCloudState(session, reading);
+  return reading;
+}
+// What a failed turn or session tells the user to do.
+export const failedText = (what, url) => `${what ? `${what} ` : ""}Send a prompt to try again, or open it to see why${url ? `: ${url}` : "."}`;
 export function cloudStateOf(session) {
   if (CLOUD_STATES.includes(session.cloudState)) return session.cloudState;
   return session.cloudId ? "unknown" : "idle";

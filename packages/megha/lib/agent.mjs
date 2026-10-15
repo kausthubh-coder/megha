@@ -3,7 +3,7 @@
 
 import crypto from "node:crypto";
 import * as acp from "@agentclientprotocol/sdk";
-import { log, sleep, UserError, CloudError, RecoveryNeeded, describeError, provenanceOf, loadSessionRecord, findSessionByCloudId, saveSessionRecord, sessionRecordOf, samePath, hintKey, saveHint, loadHint } from "./util.mjs";
+import { log, sleep, UserError, CloudError, RecoveryNeeded, describeError, provenanceOf, loadSessionRecord, findSessionByCloudId, saveSessionRecord, sessionRecordOf, samePath, hintKey, saveHint, loadHint, addNotice, takeNotices } from "./util.mjs";
 import { Turn } from "./turn.mjs";
 import { cleanPrompt, t3AttachmentDirs } from "./prompt.mjs";
 import { t3McpFrom } from "./t3mcp.mjs";
@@ -176,18 +176,25 @@ export class MeghaAgent {
     }
     s.turn = turn;
     const send = (u) => { if (!turn.muted) this.#send(s.id, u); };
+    const say = (t) => send({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: t } });
     const io = {
       turn,
       signal: turn.signal,
       update: send,
-      text: (t) => send({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: t } }),
+      text: say,
+      // Something about the user's checkout they must see (lib/util.mjs addNotice): saved first, then
+      // shown now while this turn can still talk to T3; once it is muted, at the next prompt.
+      notice: (t) => {
+        addNotice(s, t);
+        if (!turn.muted) for (const n of takeNotices(s)) say(`\n\n${n}`);
+      },
       requestPermission: (p) => (turn.muted || !turn.permissionsValid ? Promise.resolve({ outcome: { outcome: "cancelled" } }) : this.conn.requestPermission(p)),
     };
     const t0 = Date.now();
     const run = turn.run(async () => {
       if (turn.stopped) return "cancelled";
-      // A stopped turn left the checkout needing the user's attention, after T3 had its answer.
-      if (s.notice) { io.text(`${s.notice}\n\n`); s.notice = null; }
+      // Notices a stopped turn (or a megha that has since restarted) could not show: first thing now.
+      for (const n of takeNotices(s)) io.text(`${n}\n\n`);
       if (input.command) { await this.backend.command(s, input.command, io); return "end_turn"; }
       if (!s.cloudId) this.#adoptFromHint(s, input, io);
       return this.backend.prompt(s, input, io);
@@ -203,7 +210,7 @@ export class MeghaAgent {
       turn.muted = true;
       turn.track(outcome.then((x) => {
         if (x.e) log(`cancelled turn ended with: ${describeError(x.e)}`);
-        if (x.e instanceof RecoveryNeeded) s.notice = x.e.message; // shown at the next prompt
+        if (x.e instanceof RecoveryNeeded) io.notice(x.e.message); // muted: saved, shown at the next prompt
         this.#rememberThread(s);
       }), "cancelled turn");
       s.active = null;
@@ -214,7 +221,7 @@ export class MeghaAgent {
     this.#rememberThread(s);
     if (first.e) {
       if (turn.stopped) {
-        if (first.e instanceof RecoveryNeeded) { log(describeError(first.e)); io.text(first.e.message); }
+        if (first.e instanceof RecoveryNeeded) { log(describeError(first.e)); io.notice(first.e.message); }
         return { stopReason: "cancelled" };
       }
       log(`prompt failed: ${describeError(first.e)}`);

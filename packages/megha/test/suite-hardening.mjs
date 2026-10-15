@@ -467,10 +467,11 @@ export async function run({ root }) {
 
   await test("F6 claude: the turn deadline fires even while the stream only sends keepalives", async () => {
     const repo = await makeRepo({ origin: null });
+    let sent = false; // the worker runs once megha's prompt is in (megha reads it before sending)
     const calls = mockFetch(claudeBase([
-      ["POST", new RegExp(`^${AN}/v1/code/sessions/cse_f6b/events$`), () => json({ results: [{ sequence_num: "3" }] })],
+      ["POST", new RegExp(`^${AN}/v1/code/sessions/cse_f6b/events$`), () => { sent = true; return json({ results: [{ sequence_num: "3" }] }); }],
       ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_f6b/events/stream$`), (req) => keepaliveSse(req.signal)],
-      ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_f6b$`), () => json({ session: { id: "cse_f6b", worker_status: "running" } })],
+      ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_f6b$`), () => json({ session: { id: "cse_f6b", worker_status: sent ? "running" : "idle" } })],
     ]));
     // Since round 2 the deadline also interrupts the cloud session and watches for its result (at
     // most stopWaitMs) before the turn fails.
