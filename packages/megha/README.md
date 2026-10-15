@@ -16,9 +16,23 @@ renews it, or sign in again (`codex login`; `claude`, then `/login`).
 npm install -g t3-megha           # or: node index.mjs ...
 megha --backend codex           # ACP agent for Codex Cloud
 megha --backend claude          # ACP agent for Claude Code on the web
+megha --backend codex --login   # is the codex login there? if not, how to sign in (exit 0 / 1)
 megha doctor                    # checks Node, git and both logins; prints no tokens
 megha --version
 ```
+
+### Sign-in for ACP clients
+
+`initialize` offers one auth method to clients that can run a terminal sign-in (T3 with a PTY, Zed,
+the ACP Registry's CI): `codex-login` or `claude-login`, type `terminal`, args
+`--backend <name> --login`. That command only reports whether the CLI login is present and how to make
+one (`codex login`; `claude`, then `/login`). In a terminal it waits, so you can sign in elsewhere and
+press Enter to check again. It exits 0 once the login is there.
+
+Nothing in it runs a CLI login, refreshes a token or writes a credential file. `authenticate` with that
+method id does the same read-only check. A missing or expired login makes `session/new`, `session/load`,
+`session/resume` and `session/list` fail with ACP `auth_required` (-32000), so the client offers
+sign-in. With a valid login none of this shows up.
 
 Logs go to stderr. stdout carries only the protocol.
 

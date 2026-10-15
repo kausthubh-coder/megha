@@ -7,6 +7,7 @@ import { log, sleep, UserError, CloudError, RecoveryNeeded, describeError, prove
 import { Turn } from "./turn.mjs";
 import { cleanPrompt, t3AttachmentDirs } from "./prompt.mjs";
 import { t3McpFrom } from "./t3mcp.mjs";
+import { authMethodFor, clientRunsTerminalAuth } from "./login.mjs";
 
 // T3 sends session/cancel and waits only 10 s for session/prompt to return before it marks the turn
 // failed (provider-acp adapter.ts interrupt path). Return `cancelled` well inside that; the cloud
@@ -44,7 +45,9 @@ export class MeghaAgent {
     return new acp.RequestError(-32603, msg);
   }
 
-  async initialize() {
+  // authMethods: the one sign-in megha has, the backend's CLI login, as a terminal method (lib/login.mjs).
+  // It's offered only to clients that can run one (ACP rule); the ACP Registry requires it.
+  async initialize(params) {
     return {
       protocolVersion: 1,
       agentInfo: { name: `megha-${this.backend.name}`, title: this.backend.title, version: this.version },
@@ -54,11 +57,26 @@ export class MeghaAgent {
         mcpCapabilities: { http: false, sse: false },
         sessionCapabilities: { list: {}, resume: {} },
       },
-      authMethods: [],
+      authMethods: clientRunsTerminalAuth(params?.clientCapabilities) ? [authMethodFor(this.backend.name)] : [],
     };
   }
 
-  async authenticate() { return {}; }
+  // Clients must not send a terminal method here (ACP), but some do. Answer with the CLI login's state:
+  // present is success, missing is auth_required with how to sign in. Nothing is run or written.
+  async authenticate(params) {
+    if (params?.methodId !== authMethodFor(this.backend.name).id) throw acp.RequestError.invalidParams(undefined, `unknown auth method; megha offers "${authMethodFor(this.backend.name).id}"`);
+    this.#requireLogin();
+    return {};
+  }
+
+  // A missing or expired CLI login is ACP auth_required (-32000), so clients offer sign-in (T3 shows
+  // "Sign in in provider settings"). A login that is present never reaches the client as an auth error.
+  #requireLogin() {
+    try { this.backend.checkAuth(); } catch (e) {
+      if (e instanceof UserError) throw acp.RequestError.authRequired(undefined, e.message);
+      throw e;
+    }
+  }
 
   #attachT3(s, mcpServers) {
     s.t3 = t3McpFrom(mcpServers, this.env);
@@ -68,7 +86,7 @@ export class MeghaAgent {
   // Lazy: T3 calls this on every status probe. Only a local record and option lists; no cloud task.
   async newSession(params) {
     try {
-      this.backend.checkAuth();
+      this.#requireLogin();
       const session = { id: `mg_${crypto.randomUUID()}`, backend: this.backend.name, cwd: params.cwd, config: {}, createdAt: new Date().toISOString() };
       this.#attachT3(session, params.mcpServers);
       await this.backend.prepare(session);
@@ -115,7 +133,7 @@ export class MeghaAgent {
 
   async loadSession(params) {
     try {
-      this.backend.checkAuth();
+      this.#requireLogin();
       const s = await this.#bind(params.sessionId, params.cwd, params.mcpServers);
       if (s.cloudId) await this.backend.replay(s, { update: (u) => this.#send(s.id, u) });
       saveSessionRecord(s);
@@ -126,7 +144,7 @@ export class MeghaAgent {
 
   async resumeSession(params) {
     try {
-      this.backend.checkAuth();
+      this.#requireLogin();
       const s = await this.#bind(params.sessionId, params.cwd, params.mcpServers);
       this.#advertiseCommands(s);
       return { configOptions: this.backend.configOptions(s) };
@@ -135,7 +153,7 @@ export class MeghaAgent {
 
   async listSessions(params) {
     try {
-      this.backend.checkAuth();
+      this.#requireLogin();
       return await this.backend.list(params.cwd ?? process.cwd(), params.cursor ?? undefined);
     } catch (e) { throw this.rpcError(e); }
   }

@@ -28,7 +28,7 @@
     },
     "packages/megha": {
       "name": "t3-megha",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "bin": {
         "megha": "index.mjs",
       },
