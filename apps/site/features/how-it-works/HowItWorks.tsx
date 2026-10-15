@@ -105,7 +105,7 @@ function Diagram() {
 
         {/* megha */}
         <div className="absolute top-[62%] left-1/2 -translate-x-1/2 -translate-y-1/2">
-          <div className="flex items-center gap-2 rounded-full border border-border bg-surface py-2 pr-4 pl-3 shadow-[0_8px_24px_-12px_oklch(0_0_0/0.35)]">
+          <div className="flex items-center gap-2 rounded-full border border-border bg-surface py-2 pr-4 pl-3">
             <MeghaMark className="size-6" tailClassName="text-accent" />
             <span className="font-semibold">megha</span>
           </div>

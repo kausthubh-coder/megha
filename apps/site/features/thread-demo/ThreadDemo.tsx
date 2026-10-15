@@ -77,6 +77,17 @@ export function ThreadDemo() {
 
   useEffect(() => () => clearTimeout(fadeTimer.current), []);
 
+  // Pause stops every loop on the page, not just this one: the rain, the drifting clouds and the
+  // diagram run for as long as the page is open, so they need the same off switch (WCAG 2.2.2).
+  useEffect(() => {
+    const root = document.documentElement;
+    if (userPaused) root.dataset.motion = "paused";
+    else delete root.dataset.motion;
+    return () => {
+      delete root.dataset.motion;
+    };
+  }, [userPaused]);
+
   // Pause offscreen, and start the first run once a quarter of the window is in view.
   useEffect(() => {
     const el = figureRef.current;
@@ -206,7 +217,7 @@ export function ThreadDemo() {
 
             {/* Messages */}
             <div ref={viewportRef} className="relative h-[24rem] overflow-hidden sm:h-[28rem] md:h-[34rem]">
-              <div ref={columnRef} className="demo-fade grid gap-3.5 px-4 py-5 sm:px-6">
+              <div ref={columnRef} className="demo-fade grid grid-cols-[minmax(0,1fr)] gap-3.5 px-4 py-5 sm:px-6">
                 <p
                   data-follow={T.bubble}
                   className="ml-auto max-w-[44ch] rounded-md rounded-br-sm bg-subtle px-3.5 py-2.5 text-ink"
@@ -344,6 +355,7 @@ export function ThreadDemo() {
             icon={label === "Pause" ? "pause" : "play"}
           >
             {label === "Play" ? "Play the thread" : label}
+            {label === "Play" ? null : <span className="sr-only"> animations</span>}
           </DemoButton>
           {phase !== "static" ? (
             <DemoButton onClick={start} icon="replay">

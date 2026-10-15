@@ -112,7 +112,7 @@ export function HomePage() {
               <h2 id="install-title" className={h2}>
                 Set it up with one prompt
               </h2>
-              <p className="mt-4 max-w-[54ch] text-muted">
+              <p className="mt-4 max-w-[50ch] text-muted">
                 Paste it into Claude Code, Codex or a T3 thread on your computer. The agent reads the setup file, installs
                 megha from npm, checks that it runs, and adds two providers to T3 Code: Codex Cloud and Claude Code on the
                 web. It backs up T3&apos;s settings first, and it never runs your logins or opens your credential files.
@@ -184,7 +184,7 @@ export function HomePage() {
             <h2 id="unofficial-title" className="text-lg font-semibold">
               Unofficial, so read this first
             </h2>
-            <div className="mt-3 grid max-w-[54ch] gap-3 text-muted">
+            <div className="mt-3 grid max-w-[50ch] gap-3 text-muted">
               <p>
                 Megha calls the same endpoints the Codex and Claude web apps use. OpenAI and Anthropic don&apos;t document
                 them, so they can change or stop working without notice.

@@ -38,8 +38,8 @@ export const metadata: Metadata = {
 // The sky's top color in each scheme, so the browser chrome continues the page.
 export const viewport: Viewport = {
   themeColor: [
-    { media: "(prefers-color-scheme: light)", color: "#c9d6e8" },
-    { media: "(prefers-color-scheme: dark)", color: "#0f0d1c" },
+    { media: "(prefers-color-scheme: light)", color: "#c0d3eb" },
+    { media: "(prefers-color-scheme: dark)", color: "#060611" },
   ],
 };
 

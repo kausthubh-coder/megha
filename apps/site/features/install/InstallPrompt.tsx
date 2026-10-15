@@ -17,7 +17,7 @@ export function CodeBlockPrompt({ id, prompt }: { id: string; prompt: string }) 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-border bg-inset px-4 py-3 text-sm text-muted sm:px-5">
         <a
           href={SETUP_PATH}
-          className="inline-flex h-11 items-center gap-1.5 font-medium text-ink underline decoration-border underline-offset-4 hover:decoration-current sm:h-auto"
+          className="inline-flex h-11 items-center gap-1.5 font-medium text-ink underline decoration-border underline-offset-4 hover:decoration-current sm:h-auto sm:py-1"
         >
           Read the full setup
           <span aria-hidden>↗</span>

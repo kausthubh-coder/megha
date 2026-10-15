@@ -59,7 +59,7 @@
   --bank-low: oklch(0.935 0.014 275);
   --bank-rim: oklch(1 0 0);
   --underlight: oklch(0.86 0.09 65 / 0.55);
-  --rain: oklch(0.5 0.05 255 / 0.28);
+  --rain: oklch(0.5 0.05 255 / 0.2);
   --flash: oklch(1 0.03 95);
   --surface: oklch(1 0 0);
   --subtle: oklch(0.96 0.008 280);
@@ -408,7 +408,8 @@ body {
   }
 }
 
-[data-paused] * {
+[data-paused] *,
+html[data-motion="paused"] * {
   animation-play-state: paused !important;
 }
 
@@ -420,7 +421,7 @@ body {
   }
   to {
     opacity: 0;
-    transform: scale(1.35, 1.6);
+    transform: scale(1.12, 1.45);
   }
 }
 .copy-ring {
