@@ -1,6 +1,6 @@
 # CLI
 
-What a user runs in a terminal after `npm install -g megha`: help, version, and a doctor that checks Node, git and both cloud logins without printing tokens.
+What a user runs in a terminal after `npm install -g t3-megha`: help, version, and a doctor that checks Node, git and both cloud logins without printing tokens.
 
 ## Sub-features
 

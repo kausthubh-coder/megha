@@ -13,7 +13,7 @@ renews it, or sign in again (`codex login`; `claude`, then `/login`).
 ## Run
 
 ```
-npm install -g megha            # or: node index.mjs ...
+npm install -g t3-megha           # or: node index.mjs ...
 megha --backend codex           # ACP agent for Codex Cloud
 megha --backend claude          # ACP agent for Claude Code on the web
 megha doctor                    # checks Node, git and both logins; prints no tokens

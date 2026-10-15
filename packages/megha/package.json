@@ -1,5 +1,5 @@
 {
-  "name": "megha",
+  "name": "t3-megha",
   "version": "0.1.0",
   "description": "Run T3 Code (or any ACP client) threads on Codex Cloud and Claude Code on the web, using your existing logins.",
   "type": "module",

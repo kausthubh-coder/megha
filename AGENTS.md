@@ -1,7 +1,7 @@
 # Megha
 
 Megha runs T3 Code threads (or any ACP client's sessions) on Codex Cloud and Claude Code on the web, using the user's
-existing `codex` and `claude` logins. It is an ACP agent (`packages/megha`, published to npm as `megha`) plus a small
+existing `codex` and `claude` logins. It is an ACP agent (`packages/megha`, published to npm as `t3-megha`, command `megha`) plus a small
 Next.js site (`apps/site`) that explains it and gives an install prompt. What users care about most: a cloud task starts
 from their editor and its progress shows up reliably. Stack: Node 22+ ESM for the agent, Next.js + Tailwind for the
 site, bun for development.
@@ -35,7 +35,7 @@ site, bun for development.
 - Doctor: `bun run doctor` (checks deps, both CLI logins, port)
 - Site dev: `bun run dev` (port from `PORT`; ready when Next prints `Ready`)
 - Agent tests (offline): `bun run test`
-- Agent smoke against live clouds (read-only, creates nothing): `bun run --filter megha smoke`
+- Agent smoke against live clouds (read-only, creates nothing): `bun run --filter t3-megha smoke`
 - Full check (CI runs this): `bun run check`
 
 ## Start and ship

@@ -7,7 +7,7 @@ The one public page: a headline, a "Copy install prompt" button, a drawn T3 thre
 - `hero` headline "Run T3 Code threads on Codex Cloud and Claude Code on the web", the copy button and "Read the prompt first" link to `#install`.
 - `mock` the thread mock (an image with an accessible description) with a short log reveal on load, skipped with reduced motion.
 - `sections` "Install with one prompt", needs, support table (icons labelled "Works" / "Doesn't work"), unofficial note, closing section.
-- `nav` the Main nav: Install (hidden under 640 px), GitHub (`https://github.com/kausthubh-coder/megha`), npm (`https://www.npmjs.com/package/megha`).
+- `nav` the Main nav: Install (hidden under 640 px), GitHub (`https://github.com/kausthubh-coder/megha`), npm (`https://www.npmjs.com/package/t3-megha`).
 - `schemes` light and dark from `prefers-color-scheme`.
 - `responsive` no horizontal scroll at 390; the mock shows on the first screen at 390 and 1440.
 

@@ -28,4 +28,4 @@ Preconditions: the site runs and answers 200.
 
 - On Windows the clipboard comes back with CRLF line endings; compare after normalizing (the script does).
 - The default tab follows the browser's user agent; Playwright's Chrome on Windows starts on Windows.
-- The prompt tells users `npm install -g megha`. Before the first npm publish that command fails for real users: don't deploy the site to production before the package exists.
+- The prompt tells users `npm install -g t3-megha`. Before the first npm publish that command fails for real users: don't deploy the site to production before the package exists.
