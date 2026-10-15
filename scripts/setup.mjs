@@ -9,6 +9,10 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+// A cloud session (Claude Code on the web, Codex Cloud, or CLOUD=1 by hand). scripts/cloud.mjs runs only
+// there, and the doctor expects no CLI logins there.
+export const isCloud = process.env.CLAUDE_CODE_REMOTE === "true" || !!process.env.CODEX_CI || process.env.CLOUD === "1";
 const skipInstall = process.argv.includes("--skip-install");
 
 // Something answers on this host/port. A listen-only probe on 127.0.0.1 misses Next, which listens on

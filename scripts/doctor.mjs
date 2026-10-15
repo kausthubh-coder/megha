@@ -9,7 +9,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { loginChecks, toolChecks, printChecks } from "../packages/megha/lib/doctor.mjs";
-import { portIsFree } from "./setup.mjs";
+import { portIsFree, isCloud } from "./setup.mjs";
+import { findBrowser } from "./browser.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const checks = [...toolChecks()];
@@ -61,7 +62,21 @@ function behindCheck() {
   return { ok: behind === 0, name: "origin/main", detail: behind ? `HEAD is ${behind} commit${behind === 1 ? "" : "s"} behind origin/main: rebase or merge first` : "up to date" };
 }
 
-checks.push(depsCheck(), ...loginChecks(), ghCheck());
+// A cloud VM has neither CLI login, and must not: the live smoke and e2e tests run on my machine. Only
+// the agent's live paths need them; setup, the offline tests and the site don't.
+function cloudLogin(check) {
+  if (check.ok || !isCloud) return check;
+  return { ok: true, name: check.name, detail: "none, as expected in a cloud session (live cloud tests run on Kausthubh's machine)" };
+}
+
+function browserCheck() {
+  const browser = findBrowser();
+  return browser
+    ? { ok: true, name: "browser", detail: `${browser.name} for verify-megha's site-check` }
+    : { ok: false, name: "browser", detail: "none for site-check: install Google Chrome, or run `npx -y playwright@latest install chromium`" };
+}
+
+checks.push(depsCheck(), ...loginChecks().map(cloudLogin), ghCheck(), browserCheck());
 const port = Number(process.env.PORT) || 3000;
 checks.push({ ok: await portIsFree(port), name: "port", detail: `PORT ${port} ${(await portIsFree(port)) ? "is free" : "is in use: run `bun run setup` to pick a free one"}` });
 checks.push(behindCheck());

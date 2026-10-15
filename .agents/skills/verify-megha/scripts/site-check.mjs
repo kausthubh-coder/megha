@@ -7,14 +7,13 @@
 //
 // <url> is the dev server (http://localhost:<PORT>/) or a deployed URL. Default --out:
 // %TEMP%/megha-verify/<stamp>-site. Exit 1 when any check fails.
-// Playwright: uses `playwright` if installed, else the newest stable copy in the npx cache. If neither
-// exists, run `npx -y playwright@latest --version` once to fill the cache. Browser: system Chrome.
+// Playwright and the browser come from scripts/browser.mjs: system Chrome when installed, else Playwright's
+// Chromium (on a cloud VM, the one under PLAYWRIGHT_BROWSERS_PATH).
 
-import { createRequire } from "node:module";
-import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { launchBrowser } from "../../../../scripts/browser.mjs";
 
 const argv = process.argv.slice(2);
 const url = argv.find((a) => !a.startsWith("--"));
@@ -25,24 +24,7 @@ const out = resolve(outIdx >= 0 ? argv[outIdx + 1] : join(tmpdir(), "megha-verif
 const drive = !argv.includes("--no-drive");
 mkdirSync(out, { recursive: true });
 
-function loadPlaywright() {
-  const req = createRequire(import.meta.url);
-  for (const name of ["playwright", "playwright-core"]) { try { return req(name); } catch {} }
-  let cache;
-  try { cache = execSync("npm config get cache", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch {}
-  const npx = cache && join(cache, "_npx");
-  const found = (npx && existsSync(npx) ? readdirSync(npx) : [])
-    .map((d) => join(npx, d, "node_modules", "playwright"))
-    .filter((dir) => existsSync(join(dir, "package.json")))
-    .map((dir) => ({ dir, v: JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).version }))
-    .filter((c) => !c.v.includes("-"))
-    .sort((a, b) => b.v.localeCompare(a.v, undefined, { numeric: true }));
-  if (!found.length) { console.error("Playwright not found. Run `npx -y playwright@latest --version` once, then retry."); process.exit(2); }
-  return req(found[0].dir);
-}
-
-const { chromium } = loadPlaywright();
-const browser = await chromium.launch({ channel: "chrome" }).catch(() => chromium.launch());
+const browser = await launchBrowser().catch((e) => { console.error(e.message); process.exit(2); });
 const checks = [];
 const check = (name, ok, detail = "") => { checks.push({ name, ok: Boolean(ok), detail }); console.log(`${ok ? "ok  " : "FAIL"} ${name}${detail ? `  ${detail}` : ""}`); };
 
