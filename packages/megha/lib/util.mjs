@@ -194,18 +194,32 @@ const PERSISTED_KEYS = ["id", "backend", "cwd", "cloudId", "cloudState", "turnId
 // the turn that did it was stopped and T3 already has its answer (the turn's io is muted then), and
 // even if megha restarts before the next prompt. So such messages are notices: saved with the session
 // record first, then shown by the agent (lib/agent.mjs) at once if the turn can still talk, otherwise
-// at the start of the session's next prompt, and removed once shown.
+// at the start of the session's next prompt, and removed only once the client has it.
 export function addNotice(session, text) {
   session.notices = [...(session.notices ?? []), String(text)];
   try { saveSessionRecord(session); } catch (e) { log(`session save failed: ${describeError(e)}`); }
 }
-// The session's notices, removed from it (and from its record).
-export function takeNotices(session) {
-  const list = session.notices ?? [];
-  if (!list.length) return [];
-  session.notices = [];
-  try { saveSessionRecord(session); } catch (e) { log(`session save failed: ${describeError(e)}`); }
-  return list;
+// Send each of the session's notices with `write(text)` (a promise that resolves once the client has
+// the notification), in order, and remove each from the session (and its record) only when its write
+// succeeded. A rejected write (a closed ACP connection) keeps it for the next prompt. Writes start
+// synchronously, so a notice keeps its place among the turn's other output; a notice already being
+// written (session.noticesSending, not persisted) isn't sent again by an overlapping call. Resolves
+// once this call's writes have settled; never rejects.
+export function deliverNotices(session, write) {
+  const sending = (session.noticesSending ??= new Set());
+  const writes = [];
+  for (const n of session.notices ?? []) {
+    if (sending.has(n)) continue;
+    sending.add(n);
+    let p;
+    try { p = Promise.resolve(write(n)); } catch (e) { p = Promise.reject(e); }
+    writes.push(p.then(() => {
+      const i = (session.notices ?? []).indexOf(n);
+      if (i >= 0) session.notices = session.notices.toSpliced(i, 1);
+      try { saveSessionRecord(session); } catch (e) { log(`session save failed: ${describeError(e)}`); }
+    }, (e) => log(`notice not delivered, kept for the next prompt: ${describeError(e)}`)).finally(() => sending.delete(n)));
+  }
+  return Promise.all(writes);
 }
 
 // ---------- the session's cloud turn state ----------

@@ -3,7 +3,7 @@
 
 import crypto from "node:crypto";
 import * as acp from "@agentclientprotocol/sdk";
-import { log, sleep, UserError, CloudError, RecoveryNeeded, describeError, provenanceOf, loadSessionRecord, findSessionByCloudId, saveSessionRecord, sessionRecordOf, samePath, hintKey, saveHint, loadHint, addNotice, takeNotices } from "./util.mjs";
+import { log, sleep, UserError, CloudError, RecoveryNeeded, describeError, provenanceOf, loadSessionRecord, findSessionByCloudId, saveSessionRecord, sessionRecordOf, samePath, hintKey, saveHint, loadHint, addNotice, deliverNotices } from "./util.mjs";
 import { Turn } from "./turn.mjs";
 import { cleanPrompt, t3AttachmentDirs } from "./prompt.mjs";
 import { t3McpFrom } from "./t3mcp.mjs";
@@ -183,20 +183,24 @@ export class MeghaAgent {
       update: send,
       text: say,
       // Something about the user's checkout they must see (lib/util.mjs addNotice): saved first, then
-      // shown now while this turn can still talk to T3; once it is muted, at the next prompt.
+      // shown now while this turn can still talk to T3; once it is muted, at the next prompt. It stays
+      // saved until its notification is written.
       notice: (t) => {
         addNotice(s, t);
-        if (!turn.muted) for (const n of takeNotices(s)) say(`\n\n${n}`);
+        if (!turn.muted) deliverNotices(s, (n) => this.#write(s.id, `\n\n${n}`));
       },
       requestPermission: (p) => (turn.muted || !turn.permissionsValid ? Promise.resolve({ outcome: { outcome: "cancelled" } }) : this.conn.requestPermission(p)),
     };
     const t0 = Date.now();
     const run = turn.run(async () => {
       if (turn.stopped) return "cancelled";
-      // Notices a stopped turn (or a megha that has since restarted) could not show: first thing now.
-      for (const n of takeNotices(s)) io.text(`${n}\n\n`);
+      // A replacement session for this thread takes over its cloud task, and the notices that came with it.
+      const adopted = !input.command && !s.cloudId ? this.#adoptFromHint(s, input) : null;
+      // Notices a stopped turn (or a megha that has since restarted, or the session this one replaced)
+      // could not show: first thing now, before any cloud or checkout work.
+      await deliverNotices(s, (n) => this.#write(s.id, `${n}\n\n`));
+      if (adopted) io.text(adopted);
       if (input.command) { await this.backend.command(s, input.command, io); return "end_turn"; }
-      if (!s.cloudId) this.#adoptFromHint(s, input, io);
       return this.backend.prompt(s, input, io);
     });
     const outcome = run.then((r) => ({ r }), (e) => ({ e }));
@@ -239,19 +243,27 @@ export class MeghaAgent {
 
   // Rollback (and other session replacements) give megha a brand-new session for an existing thread,
   // and the next prompt carries T3's context handoff. If this thread was using a cloud task, keep
-  // using it; otherwise the handoff travels as context to a new task. Either way, say which.
-  #adoptFromHint(s, input, io) {
-    if (!input.handoff) return;
+  // using it; otherwise the handoff travels as context to a new task. Either way, say which: returns
+  // the text to show (null without a handoff). Adopting moves the old session's unshown notices here
+  // too: the thread hint will point at this session, so nothing would ever show them otherwise.
+  #adoptFromHint(s, input) {
+    if (!input.handoff) return null;
     const hint = s.t3Key ? loadHint(s.t3Key) : null;
     const rec = hint && hint.backend === this.backend.name && hint.sessionId !== s.id ? loadSessionRecord(hint.sessionId) : null;
-    if (rec?.cloudId) {
-      for (const k of CLOUD_FIELDS) if (rec[k] !== undefined) s[k] = rec[k];
-      input.text = `T3 Code started a new session for this conversation (for example after a rollback). The history below is the current state; where it differs from what you remember, follow it.\n\n${input.text}`;
-      io.text(`Continuing the same cloud task${rec.webUrl ? ` ([open](${rec.webUrl}))` : ""}; T3 started a new session for this thread, so the earlier conversation is sent along as the current state.\n\n`);
-      log(`adopted cloud task ${rec.cloudId} from session ${hint.sessionId}`);
-    } else {
-      io.text("Starting a new cloud task. The earlier conversation from this thread is sent along as context.\n\n");
+    if (!rec?.cloudId) return "Starting a new cloud task. The earlier conversation from this thread is sent along as context.\n\n";
+    for (const k of CLOUD_FIELDS) if (rec[k] !== undefined) s[k] = rec[k];
+    // The old session may still be open in this process: take the notices from that copy, the one
+    // that would otherwise save them again.
+    const old = this.sessions.get(hint.sessionId) ?? rec;
+    if (old.notices?.length) {
+      s.notices = [...old.notices, ...(s.notices ?? [])];
+      saveSessionRecord(s); // saved here before they leave the old record: a crash duplicates, never loses
+      old.notices = [];
+      try { saveSessionRecord(old); } catch (e) { log(`session save failed: ${describeError(e)}`); }
     }
+    input.text = `T3 Code started a new session for this conversation (for example after a rollback). The history below is the current state; where it differs from what you remember, follow it.\n\n${input.text}`;
+    log(`adopted cloud task ${rec.cloudId} from session ${hint.sessionId}`);
+    return `Continuing the same cloud task${rec.webUrl ? ` ([open](${rec.webUrl}))` : ""}; T3 started a new session for this thread, so the earlier conversation is sent along as the current state.\n\n`;
   }
 
   #rememberThread(s) {
@@ -266,5 +278,10 @@ export class MeghaAgent {
 
   #send(sessionId, update) {
     this.conn.sessionUpdate({ sessionId, update }).catch((e) => log(`sessionUpdate failed: ${describeError(e)}`));
+  }
+
+  // One text chunk whose delivery the caller waits on (a notice is removed only once it is written).
+  #write(sessionId, text) {
+    return this.conn.sessionUpdate({ sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } });
   }
 }

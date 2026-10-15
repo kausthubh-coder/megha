@@ -27,6 +27,43 @@ const refusal = async (p) => {
   return r.e;
 };
 
+// Blocker 2's setup (also used by suite-round5.mjs): a checkout left needing recovery after Stop.
+// Astra's probe: /apply through the real agent, Stop while `git apply` runs, then git's time limit
+// kills it halfway through. The answer to T3 was already `cancelled` (muted), so the warning must
+// travel through the session's durable notices.
+export const cancelledPartialApply = async (label, { agentEnv = {} } = {}) => {
+  const repo = await makeRepo({ origin: `https://github.com/acme/${label}.git`, files: { "a.txt": "one\n", "b.txt": "bee\n" } });
+  const env = codexEnv(`env_${label}`, label, `acme/${label}`);
+  const diff = `${diffOf("one", "two", "a.txt")}${diffOf("bee", "bop", "b.txt")}`;
+  mockFetch(codexBase([env], [
+    ["GET", new RegExp(`task_e_${label}$`), () => json(details(`task_e_${label}`, env, { output_items: [{ type: "output_diff", diff }] }))],
+  ]));
+  const gate = deferred();
+  let applying = false;
+  const applyGit = async (cwd, args, o) => {
+    if (args[0] === "apply" && !args.includes("--check") && !args.includes("-R")) {
+      applying = true;
+      await gate.promise;
+      await git(cwd, ["apply", "--include=a.txt", args.at(-1)]); // one file of two written...
+      return { code: -1, stdout: "", stderr: "", timedOut: true }; // ...when the time limit killed it
+    }
+    return git(cwd, args, o);
+  };
+  const conn = fakeConn();
+  const a = new MeghaAgent(conn, new CodexBackend({ pollMs: 60_000, applyGit }), { env: agentEnv });
+  const { sessionId } = await a.newSession({ cwd: repo, mcpServers: [] });
+  Object.assign(a.sessions.get(sessionId), { cloudId: `task_e_${label}`, webUrl: `https://chatgpt.com/codex/tasks/task_e_${label}`, cloudState: "idle", createdIn: repo });
+  const p = a.prompt({ sessionId, prompt: text("/apply") });
+  await until(() => applying);
+  await a.cancel({ sessionId });
+  assert.equal((await p).stopReason, "cancelled");
+  gate.resolve();
+  await a.sessions.get(sessionId).turn.settled;
+  assert.equal(readA(repo), "two\n", "the checkout really is partly changed");
+  return { a, conn, sessionId, repo };
+};
+export const PARTLY = /partly changed/;
+
 export async function run() {
   // ============ 1. a fresh cloud response beats the saved state, in both directions ============
   await test("R4-1 codex: a saved idle task the cloud reports running (continued on the web) is reconciled on resume; no follow-up is sent", async () => {
@@ -111,43 +148,8 @@ export async function run() {
     assert.equal(s.cloudState, "running");
   });
 
-  // ============ 2. a checkout left needing recovery is always reported, even after Stop ============
-  // Astra's probe: /apply through the real agent, Stop while `git apply` runs, then git's time limit
-  // kills it halfway through. The answer to T3 was already `cancelled` (muted), so the warning must
-  // travel through the session's durable notices.
-  const cancelledPartialApply = async (label) => {
-    const repo = await makeRepo({ origin: `https://github.com/acme/${label}.git`, files: { "a.txt": "one\n", "b.txt": "bee\n" } });
-    const env = codexEnv(`env_${label}`, label, `acme/${label}`);
-    const diff = `${diffOf("one", "two", "a.txt")}${diffOf("bee", "bop", "b.txt")}`;
-    mockFetch(codexBase([env], [
-      ["GET", new RegExp(`task_e_${label}$`), () => json(details(`task_e_${label}`, env, { output_items: [{ type: "output_diff", diff }] }))],
-    ]));
-    const gate = deferred();
-    let applying = false;
-    const applyGit = async (cwd, args, o) => {
-      if (args[0] === "apply" && !args.includes("--check") && !args.includes("-R")) {
-        applying = true;
-        await gate.promise;
-        await git(cwd, ["apply", "--include=a.txt", args.at(-1)]); // one file of two written...
-        return { code: -1, stdout: "", stderr: "", timedOut: true }; // ...when the time limit killed it
-      }
-      return git(cwd, args, o);
-    };
-    const conn = fakeConn();
-    const a = new MeghaAgent(conn, new CodexBackend({ pollMs: 60_000, applyGit }), { env: {} });
-    const { sessionId } = await a.newSession({ cwd: repo, mcpServers: [] });
-    Object.assign(a.sessions.get(sessionId), { cloudId: `task_e_${label}`, webUrl: `https://chatgpt.com/codex/tasks/task_e_${label}`, cloudState: "idle", createdIn: repo });
-    const p = a.prompt({ sessionId, prompt: text("/apply") });
-    await until(() => applying);
-    await a.cancel({ sessionId });
-    assert.equal((await p).stopReason, "cancelled");
-    gate.resolve();
-    await a.sessions.get(sessionId).turn.settled;
-    assert.equal(readA(repo), "two\n", "the checkout really is partly changed");
-    return { a, conn, sessionId, repo };
-  };
-  const PARTLY = /partly changed/;
 
+  // ============ 2. a checkout left needing recovery is always reported, even after Stop ============
   await test("R4-2 codex: Stop during /apply, then a timeout-killed git apply: the next prompt shows the recovery warning", async () => {
     const { a, conn, sessionId } = await cancelledPartialApply("r42");
     assert.doesNotMatch(shown(conn, sessionId), PARTLY, "(muted: T3 already had its answer)");

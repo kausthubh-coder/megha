@@ -553,6 +553,14 @@ export class CodexBackend {
       session.turnId = turn.id;
       return this.#afterTurn(session, await this.#streamTurn(session, turn.id, io), io);
     }
+    // A failed turn megha already saw end has nothing to continue, and treating the continuation as a
+    // normal prompt would post it as a retry nobody asked for: say so and how to go on, send nothing
+    // (the user's own next prompt is the retry). One not seen yet is shown below, failure included.
+    if (reading === "failed" && turn.id === session.doneTurnId) {
+      const known = TURN_ERROR_CODES[turnErrorCode(turn.error)];
+      io.text(failedText(`The last turn failed.${known ? ` ${known}` : ""}`, session.webUrl));
+      return "end_turn";
+    }
     if (turn.id === session.doneTurnId) return null;
     log(`showing turn ${turn.id} that finished while detached`);
     session.turnId = turn.id;
