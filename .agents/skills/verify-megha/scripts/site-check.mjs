@@ -64,8 +64,12 @@ for (const colorScheme of ["light", "dark"]) {
     check(`${tag} color-scheme applied`, scheme.includes(colorScheme), scheme);
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
     check(`${tag} no horizontal scroll`, overflow <= 0, `${overflow}px wider than the viewport`);
-    const copyBtn = page.getByRole("button", { name: "Copy install prompt" }).first();
-    check(`${tag} hero copy button visible`, await copyBtn.isVisible());
+    // The hero shows the whole prompt with its copy button, above the fold.
+    const heroPrompt = page.locator("#hero-prompt");
+    check(`${tag} hero prompt visible`, await heroPrompt.isVisible());
+    const copyBtn = page.getByRole("button", { name: "Copy prompt" }).first();
+    const box = await copyBtn.boundingBox();
+    check(`${tag} hero copy button above the fold`, !!box && box.y + box.height <= height, box ? `bottom at ${Math.round(box.y + box.height)}px` : "not found");
     await page.screenshot({ path: join(out, `home-${tag}.png`), fullPage: true });
     writeFileSync(join(out, `home-${tag}.aria.yml`), await page.locator("body").ariaSnapshot());
     check(`${tag} no console or page errors`, errors.length === 0, errors.slice(0, 3).join(" | "));
@@ -78,11 +82,11 @@ if (drive) {
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, permissions: ["clipboard-read", "clipboard-write"] });
   const page = await ctx.newPage();
   await page.goto(url, { waitUntil: "load" });
-  await page.getByRole("button", { name: "Copy install prompt" }).first().click();
+  await page.getByRole("button", { name: "Copy prompt" }).first().click();
   const live = page.locator('[aria-live="polite"]', { hasText: "Copied to clipboard" }).first();
   check("copy: live region says Copied to clipboard", await live.waitFor({ state: "attached", timeout: 3000 }).then(() => true, () => false));
   const clip = await page.evaluate(() => navigator.clipboard.readText());
-  const shown = await page.locator("#install-prompt").innerText();
+  const shown = await page.locator("#hero-prompt").innerText();
   const norm = (s) => s.replace(/\r\n/g, "\n").trim();
   check("copy: clipboard equals the prompt on the page", norm(clip) === norm(shown), `clipboard ${clip.length} chars, shown ${shown.length}`);
   check("copy: prompt points at the hosted setup", clip.includes("/setup.md"));

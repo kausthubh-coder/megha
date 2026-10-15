@@ -21,6 +21,12 @@
   --color-success: var(--success);
   --color-danger: var(--danger);
   --color-bank: var(--bank-low);
+  /* Real values only inside the T3 demo window (.t3-window). */
+  --color-bubble: var(--subtle);
+  --color-composer: var(--surface);
+  --color-link: var(--accent);
+  --color-send: var(--accent-soft);
+  --color-claude: var(--ink);
 
   --font-sans: var(--font-instrument), ui-sans-serif, system-ui, sans-serif;
   --font-mono: var(--font-jetbrains), ui-monospace, "Cascadia Mono", Menlo, monospace;
@@ -151,25 +157,13 @@ body {
   }
 }
 
-@keyframes float {
-  50% {
-    transform: translateY(-7px);
+@keyframes hero-in {
+  from {
+    opacity: 0;
+    transform: translateY(24px);
   }
 }
 
-@keyframes bank-in {
-  from {
-    opacity: 0;
-    transform: translateY(32px) scale(0.965);
-  }
-}
-
-@keyframes tail-in {
-  from {
-    opacity: 0;
-    transform: scale(0.2, 0);
-  }
-}
 
 @keyframes fall {
   from {
@@ -254,15 +248,8 @@ body {
   .sky-drift {
     animation: drift var(--drift, 140s) linear infinite;
   }
-  .sky-float {
-    animation: float 9s ease-in-out infinite;
-  }
-  .bank-in {
-    animation: bank-in 1100ms var(--ease-out) both;
-  }
-  .tail-in {
-    animation: tail-in 700ms var(--ease-out) 650ms both;
-    transform-origin: 30% 0;
+  .hero-in {
+    animation: hero-in 900ms var(--ease-out) calc(var(--i, 0) * 90ms) both;
   }
   .rain-fall {
     animation: fall var(--fall, 0.8s) linear infinite;
@@ -431,6 +418,39 @@ html[data-motion="paused"] * {
   .copy-ring {
     animation: t-hide 400ms ease-out both;
   }
+}
+
+/* The demo window is T3 Code's own dark UI in both color schemes: its colors, measured from the app,
+   and its system font. The --color-* tokens are set here directly, because the :root ones resolve their
+   var() at :root and wouldn't follow a scoped --surface. */
+.t3-window {
+  color-scheme: dark;
+  --color-surface: #0b0b0b;
+  --color-inset: #060606;
+  --color-subtle: #1c1c1c;
+  --color-bubble: #171717;
+  --color-composer: #121212;
+  --color-border: #1f1f1f;
+  --color-ink: #ececec;
+  --color-muted: #8c8c8c;
+  --color-accent: #6ea8ff;
+  --color-link: #6ea8ff;
+  --color-send: #1b3270;
+  --color-claude: #d97757;
+  --color-success: #3fb950;
+  --color-danger: #f85149;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+/* T3's sidebar header: a blue night sky with a few stars. */
+.t3-sky {
+  background:
+    radial-gradient(1px 1px at 18% 28%, #fffc, transparent),
+    radial-gradient(1px 1px at 46% 72%, #fff9, transparent),
+    radial-gradient(1.5px 1.5px at 67% 34%, #fffb, transparent),
+    radial-gradient(1px 1px at 86% 62%, #fff8, transparent),
+    radial-gradient(1px 1px at 93% 18%, #fffa, transparent),
+    linear-gradient(100deg, #2346b8, #142a6e 55%, #0a1230);
 }
 
 /* Between runs the finished thread fades out before the next one starts. */

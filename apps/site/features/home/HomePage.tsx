@@ -2,8 +2,7 @@ import Link from "next/link";
 import { MeghaMark } from "@/features/brand/MeghaMark";
 import { ClaudeIcon, OpenAIIcon } from "@/features/brand/ProviderIcons";
 import { HowItWorks } from "@/features/how-it-works/HowItWorks";
-import { CodeBlockPrompt } from "@/features/install/InstallPrompt";
-import { CopyButton } from "@/features/install/CopyButton";
+import { PromptBox } from "@/features/install/InstallPrompt";
 import { ManualSteps } from "@/features/install/ManualSteps";
 import {
   CLAUDE_CODE_URL,
@@ -14,7 +13,6 @@ import {
   SETUP_PATH,
   buildInstallPrompt,
 } from "@/features/install/install";
-import { CloudBank } from "@/features/sky/CloudBank";
 import { CloudBreak } from "@/features/sky/CloudBreak";
 import { StormSky } from "@/features/sky/StormSky";
 import { ThreadDemo } from "@/features/thread-demo/ThreadDemo";
@@ -56,31 +54,27 @@ export function HomePage() {
             </nav>
           </header>
 
-          <CloudBank
-            id="hero"
-            animateIn
-            className="mx-auto mt-16 max-w-[64rem] px-6 pt-2 pb-9 sm:mx-12 sm:mt-24 sm:px-14 sm:pb-11 lg:mx-auto"
-            tailClassName="left-[22%] w-20 sm:left-[30%] sm:w-28"
-          >
-            <div className="text-center">
-              <h1 id="hero-title" className="mx-auto max-w-[17ch] font-display text-h1 font-semibold text-balance sm:max-w-[21ch]">
-                Run T3 Code threads on Codex Cloud and Claude Code on the web
-              </h1>
-              <p className="mx-auto mt-5 max-w-[50ch] text-muted text-pretty">
-                An open-source ACP agent for T3 Code. Your prompt starts a cloud task, and its setup log, commands, diff
-                and answer stream back into the thread. It uses the codex and claude logins you already have.
-              </p>
-              <div className="mt-7 flex flex-col items-center justify-center gap-x-6 gap-y-2 sm:flex-row">
-                <CopyButton text={prompt} label="Copy install prompt" fallbackTargetId="install-prompt" />
-                <a href={SETUP_PATH} className={`inline-flex h-11 items-center text-sm text-ink ${link}`}>
+          <div className="relative z-10 mx-auto mt-16 max-w-[64rem] px-5 text-center sm:mt-24 sm:px-8">
+            <h1
+              id="hero-title"
+              className="hero-in mx-auto max-w-[17ch] font-display text-h1 font-semibold text-balance sm:max-w-[21ch]"
+            >
+              Run T3 Code threads on Codex Cloud and Claude Code on the web
+            </h1>
+            <p className="hero-in mx-auto mt-5 max-w-[50ch] text-muted text-pretty" style={{ "--i": 1 } as React.CSSProperties}>
+              An open-source ACP agent for T3 Code. Your prompt starts a cloud task, and its setup log, commands, diff and
+              answer stream back into the thread. It uses the codex and claude logins you already have.
+            </p>
+            <div className="hero-in mx-auto mt-9 max-w-[58rem]" style={{ "--i": 2 } as React.CSSProperties}>
+              <PromptBox id="hero-prompt" prompt={prompt} />
+              <p className="mt-3 text-sm text-muted text-pretty">
+                Paste it into Claude Code, Codex or a T3 thread.{" "}
+                <a href={SETUP_PATH} className={`text-ink ${link}`}>
                   Read the full setup
                 </a>
-              </div>
-              <p className="mx-auto mt-4 hidden text-xs text-muted sm:block">
-                Copies one line: <code className="font-mono text-ink">{prompt}</code>
               </p>
             </div>
-          </CloudBank>
+          </div>
 
           <div className="mt-20 px-3 sm:mt-24 sm:px-8">
             <ThreadDemo />
@@ -119,7 +113,13 @@ export function HomePage() {
               </p>
             </div>
             <div className="mt-8" data-reveal>
-              <CodeBlockPrompt id="install-prompt" prompt={prompt} />
+              <PromptBox id="install-prompt" prompt={prompt} />
+              <p className="mt-3 text-sm text-muted">
+                <a href={SETUP_PATH} className={`text-ink ${link}`}>
+                  Read the full setup
+                </a>
+                : it&apos;s the file the agent follows, with what it runs, what it edits, and what it never touches.
+              </p>
             </div>
 
             <h3 className="mt-24 text-lg font-semibold" data-reveal>
@@ -201,23 +201,15 @@ export function HomePage() {
         <CloudBreak className="mt-20 sm:mt-28" />
 
         <section aria-labelledby="start-title" className="px-5 pt-36 pb-32 sm:px-8 sm:pt-44 sm:pb-40">
-          <CloudBank
-            id="end"
-            className="mx-auto max-w-3xl px-6 pt-2 pb-12 sm:px-14"
-            tailClassName="left-[26%] w-16 sm:w-24"
-          >
-            <div className="text-center" data-reveal>
-              <h2 id="start-title" className={h2}>
-                Start your first cloud thread
-              </h2>
-              <p className="mx-auto mt-4 max-w-[44ch] text-muted">
-                Paste the prompt into your coding agent, then pick Codex Cloud or Claude Code on the web in T3.
-              </p>
-              <div className="mt-8">
-                <CopyButton text={prompt} label="Copy install prompt" fallbackTargetId="install-prompt" />
-              </div>
-            </div>
-          </CloudBank>
+          <div className="mx-auto max-w-2xl text-center" data-reveal>
+            <h2 id="start-title" className={h2}>
+              Start your first cloud thread
+            </h2>
+            <p className="mx-auto mt-4 max-w-[44ch] text-muted">
+              Paste the prompt into your coding agent, then pick Codex Cloud or Claude Code on the web in T3.
+            </p>
+            <PromptBox id="end-prompt" prompt={prompt} className="mt-8" />
+          </div>
         </section>
       </main>
 
