@@ -285,7 +285,10 @@ export async function run() {
 
   // ======================= 3. cancelling git ends its whole process tree =======================
   const sockets = new Set();
-  const server = net.createServer((sock) => { sockets.add(sock); sock.on("error", () => {}); sock.on("close", () => sockets.delete(sock)); }); // accepts, never answers, never closes
+  // Accepts and never answers. resume() reads (and drops) what git sends: a socket nobody reads never
+  // sees the peer's FIN, so on Linux/macOS the server side sat in CLOSE_WAIT after git died and the
+  // "connection closed" check failed even though git's whole tree was gone.
+  const server = net.createServer((sock) => { sockets.add(sock); sock.resume(); sock.on("error", () => {}); sock.on("close", () => sockets.delete(sock)); });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   const hangUrl = `http://127.0.0.1:${server.address().port}/acme/tree.git`;
   // Start a stalled ls-remote, wait for its HTTP connection, record git's process tree, end it with
@@ -305,14 +308,6 @@ export async function run() {
     const survivors = await stillRunning(during);
     assert.deepEqual(survivors, [], `${label}: no process of git's tree survives once the call settled`);
     await until(() => sockets.size === opened, 2000).catch(() => {});
-    if (sockets.size !== opened && process.platform !== "win32") {
-      // [DEBUG-posixkill] who still holds the connection?
-      const port = server.address().port;
-      const cmd = process.platform === "darwin" ? ["lsof", ["-nP", `-iTCP:${port}`]] : ["ss", ["-tnpa", `( sport = :${port} or dport = :${port} )`]];
-      const out = await new Promise((r) => { const c = spawn(cmd[0], cmd[1]); let t = ""; c.stdout.on("data", (d) => (t += d)); c.stderr.on("data", (d) => (t += d)); c.on("close", () => r(t)); c.on("error", (e) => r(String(e))); });
-      const ps = await new Promise((r) => { const c = spawn("ps", ["-A", "-o", "pid,ppid,pgid,stat,comm"]); let t = ""; c.stdout.on("data", (d) => (t += d)); c.on("close", () => r(t)); });
-      console.log(`[DEBUG-posixkill] ${label} during=${JSON.stringify(during)} sockets=${sockets.size} opened=${opened}\n${out}\n${ps.split("\n").filter((l) => /git|curl|PID/.test(l)).join("\n")}`);
-    }
     assert.equal(sockets.size, opened, `${label}: the HTTP connection was closed`);
     return r;
   };
