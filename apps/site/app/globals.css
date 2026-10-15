@@ -1,26 +1,123 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/* Tokens from .critly/direction.md. Only these exist: Tailwind's default palette, fonts and type sizes
+   are cleared so components can't reach for an off-system value. */
+@theme {
+  --color-*: initial;
+  --font-*: initial;
+  --text-*: initial;
+
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-subtle: var(--subtle);
+  --color-inset: var(--inset);
+  --color-border: var(--border);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+
+  --font-sans: var(--font-instrument), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, "Cascadia Mono", Menlo, monospace;
+
+  /* Persuade scale: 13 / 15 / 18 body / 22 / h2 28→36 / h1 38→60 */
+  --text-xs: 0.8125rem;
+  --text-xs--line-height: 1.5;
+  --text-sm: 0.9375rem;
+  --text-sm--line-height: 1.55;
+  --text-base: clamp(1.0625rem, 1rem + 0.25vw, 1.125rem);
+  --text-base--line-height: 1.6;
+  --text-lg: 1.375rem;
+  --text-lg--line-height: 1.35;
+  --text-h2: clamp(1.75rem, 1.4rem + 1.4vw, 2.25rem);
+  --text-h2--line-height: 1.15;
+  --text-h1: clamp(2.375rem, 1.5rem + 3.8vw, 3.75rem);
+  --text-h1--line-height: 1.04;
+
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;
+
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+:root {
+  color-scheme: light;
+  --bg: oklch(0.985 0.004 250);
+  --surface: oklch(1 0 0);
+  --subtle: oklch(0.962 0.007 250);
+  --inset: oklch(0.975 0.005 250);
+  --border: oklch(0.9 0.01 252);
+  --ink: oklch(0.22 0.02 260);
+  --muted: oklch(0.46 0.02 256);
+  --accent: oklch(0.53 0.16 255);
+  --accent-hover: oklch(0.47 0.16 255);
+  --accent-fg: oklch(0.99 0 0);
+  --accent-soft: oklch(0.94 0.035 250);
+  --success: oklch(0.5 0.13 150);
+  --warning: oklch(0.55 0.12 70);
+  --shadow-window: 0 1px 2px oklch(0.22 0.02 260 / 0.06), 0 24px 48px -24px oklch(0.22 0.04 260 / 0.25);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    color-scheme: dark;
+    --bg: oklch(0.19 0.022 258);
+    --surface: oklch(0.225 0.022 258);
+    --subtle: oklch(0.255 0.022 258);
+    --inset: oklch(0.165 0.02 258);
+    --border: oklch(0.32 0.022 258);
+    --ink: oklch(0.95 0.008 250);
+    --muted: oklch(0.74 0.02 252);
+    --accent: oklch(0.8 0.1 235);
+    --accent-hover: oklch(0.86 0.08 235);
+    --accent-fg: oklch(0.2 0.03 258);
+    --accent-soft: oklch(0.3 0.05 245);
+    --success: oklch(0.78 0.13 150);
+    --warning: oklch(0.82 0.12 80);
+    --shadow-window: 0 1px 0 oklch(1 0 0 / 0.04) inset, 0 24px 48px -24px oklch(0 0 0 / 0.5);
   }
 }
 
+html {
+  background: var(--bg);
+  color: var(--ink);
+  scroll-padding-top: 1.5rem;
+  -webkit-text-size-adjust: 100%;
+}
+
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--accent-soft);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html {
+    scroll-behavior: smooth;
+  }
+
+  /* The thread illustration's work log arrives row by row, once, on load. Under 600ms in total. */
+  .mock-reveal {
+    animation: mock-reveal 320ms var(--ease-out) both;
+    animation-delay: calc(var(--i) * 90ms + 120ms);
+  }
+}
+
+@keyframes mock-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
 }

@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Local, gitignored screenshots and the throwaway scripts that take them.
+    "screenshots/**",
   ]),
 ]);
 
