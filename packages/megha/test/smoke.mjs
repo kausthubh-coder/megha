@@ -1,5 +1,5 @@
 // Smoke test: spawn the agent like T3 would and exercise initialize -> session/new -> config options ->
-// session/set_config_option -> session/list. Creates no cloud tasks.
+// session/set_config_option -> session/list. Creates no cloud tasks or environments.
 //   node test/smoke.mjs [codex|claude] [cwd]
 
 import { startAgent, T3_INITIALIZE } from "./client.mjs";
@@ -15,9 +15,10 @@ for (const backend of backends) {
   try {
     let t = Date.now();
     const init = await agent.request("initialize", T3_INITIALIZE);
-    console.log(`initialize (${Date.now() - t} ms): protocolVersion=${init.protocolVersion} agent=${init.agentInfo?.title} caps=${JSON.stringify(init.agentCapabilities)}`);
+    console.log(`initialize (${Date.now() - t} ms): protocolVersion=${init.protocolVersion} agent=${init.agentInfo?.name} "${init.agentInfo?.title}" caps=${JSON.stringify(init.agentCapabilities)}`);
     if (init.protocolVersion !== 1 || "info" in init) throw new Error("expected a v1 initialize response");
     if (!init.agentCapabilities?.loadSession || !init.agentCapabilities?.sessionCapabilities?.list) throw new Error("list/load not advertised");
+    if (!init.agentCapabilities?.promptCapabilities?.image) throw new Error("image prompts not advertised");
 
     t = Date.now();
     const s = await agent.request("session/new", { cwd, mcpServers: [] });
@@ -25,12 +26,26 @@ for (const backend of backends) {
     for (const o of s.configOptions ?? []) {
       console.log(`  option ${o.id} [${o.category ?? "-"}] = ${o.currentValue}  choices: ${o.options.map((c) => `${c.value}${c.name !== c.value ? ` (${c.name})` : ""}`).join(" | ")}`);
     }
+    // T3 lists models only from a select option with category "model" and never sends default/auto.
+    const model = s.configOptions.find((o) => o.category === "model" && o.type === "select");
+    if (!model || model.options.length < 2) throw new Error("no model list");
+    if (["default", "auto"].includes(model.currentValue)) throw new Error(`model currentValue is ${model.currentValue}`);
     const mode = s.configOptions.find((o) => o.category === "mode");
+    if (!mode.options.some((c) => c.value === "plan")) throw new Error("no plan mode value");
     const other = mode.options.find((c) => c.value !== mode.currentValue)?.value;
     const set = await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: mode.id, value: other });
     const after = set.configOptions.find((o) => o.id === mode.id).currentValue;
     console.log(`set_config_option ${mode.id}=${other} -> ${after}`);
     if (after !== other) throw new Error("set_config_option did not take");
+    const otherModel = model.options.find((c) => c.value !== model.currentValue).value;
+    const setM = await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: model.id, value: otherModel });
+    if (setM.configOptions.find((o) => o.id === model.id).currentValue !== otherModel) throw new Error("model selection did not take");
+    console.log(`set_config_option ${model.id}=${otherModel} ok`);
+
+    await new Promise((r) => setTimeout(r, 300));
+    const cmds = updates.find((u) => u.update.sessionUpdate === "available_commands_update");
+    console.log(`available commands: ${cmds?.update.availableCommands.map((c) => `/${c.name}`).join(" ") ?? "(none)"}`);
+    if (!cmds) throw new Error("no available_commands_update after session/new");
 
     t = Date.now();
     const list = await agent.request("session/list", { cwd });

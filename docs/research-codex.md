@@ -114,3 +114,14 @@ No cancel/archive/follow-up anywhere in codex-rs.
   Methods: item/agentMessage/delta 164 (word-level, delivered in ~1 s bursts), item/reasoning/summaryTextDelta 3,
   item/completed 7 (NO item/started: commands show only when finished), rawResponseItem/completed 14, thread/tokenUsage/updated 4.
   No `log` items arrived (setup logs not streamed, or cached).
+
+## 10. Found while building megha (2026-10-14)
+- Models: `GET /wham/models?client_version=0.162.1` → `{models:[{slug, display_name, visibility, priority, default_reasoning_level, supported_reasoning_levels, context_window}]}`.
+  `client_version` is required (a low value returns `[]`). Show `visibility:"list"`, sort by `priority`.
+- Model choice: the desktop app sends top-level `metadata:{model_slug}` on new tasks and follow-ups. In live tests every turn still
+  reported `model_version: gpt-5.6-sol` (tried gpt-5.6-luna and gpt-6.1-sol), and `user_model_slug` reads the literal `"slug"` on
+  every task. Unclear whether the cloud honours the choice for this account.
+- GitHub connector id `connector_76869538009648d5b282a4bb21c3d157` is a constant in the desktop bundle (the ChatGPT GitHub app), not per account.
+- Repo search: `GET /wham/github/repositories/search/all-installations?query&limit&page&connector_id` → `{repositories:[{id:"github-<n>", repository_full_name, default_branch, visibility, permissions}]}`.
+- PR from a turn: `POST /wham/tasks/{id}/turns/{turn}/pr` with `{}` or `{mode:"draft"}`.
+- Images: uploaded through `/backend-api/files` the same way the desktop app does, then referenced from `input_items` (see packages/megha/lib/image.mjs).

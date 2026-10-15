@@ -1,22 +1,39 @@
-// Codex Cloud backend (chatgpt.com/backend-api/wham). See cloud-threads-research/codex/FINDINGS.md.
+// Codex Cloud backend (chatgpt.com/backend-api/wham). Endpoint and body shapes: docs/research-codex.md.
 // Auth: ~/.codex/auth.json, read fresh per request and never refreshed here (refresh tokens rotate).
 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { posix } from "node:path";
-import { log, sleep, sseFrames, tail, git, repoInfo, UserError, isoFromEpochSeconds, saveSessionRecord, cleanTerminal } from "./util.mjs";
+import { join, posix } from "node:path";
+import {
+  log, sleep, sseFrames, tail, repoInfo, UserError, isoFromEpochSeconds, saveSessionRecord, cleanTerminal,
+  cachedList, readCache, writeCache, localChanges, localPatch, setupCommandsFor, findPullRequestUrl,
+} from "./util.mjs";
 import { codexChangesToPatch, diffToolCall, applyLocally, diffFiles } from "./diff.mjs";
+import { imageSize, imageExtension } from "./image.mjs";
+import { linkPullRequest } from "./t3mcp.mjs";
+import { VERSION } from "./version.mjs";
 
 const BASE = (process.env.CODEX_CLOUD_TASKS_BASE_URL || "https://chatgpt.com/backend-api").replace(/\/+$/, "");
 const WEB = BASE.replace(/\/backend-api$/, "");
-const USER_AGENT = "cloud-acp/0.1 (T3 Code ACP bridge)";
+const USER_AGENT = `megha/${VERSION} (ACP agent for Codex Cloud)`;
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 const POLL_MS = 5000;
+const CLIENT_VERSION = "0.162.1"; // the Codex CLI version the model list is requested for
+// The ChatGPT GitHub connector id the desktop app hardcodes for GitHub environments (research-codex.md §9).
+const GITHUB_CONNECTOR_ID = "connector_76869538009648d5b282a4bb21c3d157";
+export const DEFAULT_MODEL = "gpt-5.6-sol";
+// Used when the live list can't be fetched (slugs from GET /wham/models, 2026-10-14).
+export const FALLBACK_MODELS = [
+  { id: "gpt-6.1-sol", name: "GPT-6.1-Sol" }, { id: "gpt-6-astra", name: "GPT-6-Astra" }, { id: "gpt-6-sol", name: "GPT-6-Sol" },
+  { id: "gpt-6-luna", name: "GPT-6-Luna" }, { id: "gpt-5.6-sol", name: "GPT-5.6-Sol" }, { id: "gpt-5.6-terra", name: "GPT-5.6-Terra" },
+  { id: "gpt-5.6-luna", name: "GPT-5.6-Luna" },
+];
+const MODES = ["code", "ask", "plan"];
+const PLAN_PREFIX = "Plan mode: investigate with read-only actions and reply with a concrete implementation plan. Do not implement it.\n\n";
 
-const AUTH_HELP = "Run `codex login status` (or any `codex` command) so the Codex CLI refreshes its login, then retry. cloud-acp never refreshes tokens itself.";
+const AUTH_HELP = "Run `codex login status` (or any `codex` command) so the Codex CLI refreshes its login, then retry. megha never refreshes tokens itself.";
 
-function readAuth() {
+export function readAuth() {
   const file = join(process.env.CODEX_HOME || join(homedir(), ".codex"), "auth.json");
   let auth;
   try { auth = JSON.parse(readFileSync(file, "utf8")); } catch (e) {
@@ -27,13 +44,18 @@ function readAuth() {
   let claims = null;
   try { claims = JSON.parse(Buffer.from(t.access_token.split(".")[1], "base64url").toString("utf8")); } catch {}
   if (claims?.exp && claims.exp * 1000 < Date.now() + 60_000) throw new UserError(`Codex Cloud: your ChatGPT token has expired. ${AUTH_HELP}`);
-  return { token: t.access_token, accountId: t.account_id ?? claims?.["https://api.openai.com/auth"]?.chatgpt_account_id ?? null };
+  return { token: t.access_token, accountId: t.account_id ?? claims?.["https://api.openai.com/auth"]?.chatgpt_account_id ?? null, expiresAt: claims?.exp ? claims.exp * 1000 : null };
+}
+
+function authHeaders(accept = "application/json") {
+  const auth = readAuth();
+  const headers = { Authorization: `Bearer ${auth.token}`, "User-Agent": USER_AGENT, Accept: accept };
+  if (auth.accountId) headers["ChatGPT-Account-Id"] = auth.accountId;
+  return headers;
 }
 
 async function api(method, path, body, { signal } = {}) {
-  const auth = readAuth();
-  const headers = { Authorization: `Bearer ${auth.token}`, "User-Agent": USER_AGENT, Accept: "application/json" };
-  if (auth.accountId) headers["ChatGPT-Account-Id"] = auth.accountId;
+  const headers = authHeaders();
   if (body) headers["Content-Type"] = "application/json";
   const res = await fetch(BASE + path, { method, headers, body: body ? JSON.stringify(body) : undefined, redirect: "error", signal });
   const text = await res.text();
@@ -48,29 +70,48 @@ async function api(method, path, body, { signal } = {}) {
 }
 
 async function openStream(path, signal) {
-  const auth = readAuth();
-  const headers = { Authorization: `Bearer ${auth.token}`, "User-Agent": USER_AGENT, Accept: "text/event-stream" };
-  if (auth.accountId) headers["ChatGPT-Account-Id"] = auth.accountId;
-  const res = await fetch(BASE + path, { headers, signal, redirect: "error" });
+  const res = await fetch(BASE + path, { headers: authHeaders("text/event-stream"), signal, redirect: "error" });
   if (!res.ok) throw new Error(`Codex Cloud stream failed: HTTP ${res.status}`);
   return res;
 }
 
 const enc = encodeURIComponent;
 const taskUrl = (id) => `${WEB}/codex/tasks/${id}`;
+const message = (text) => ({ type: "message", role: "user", content: [{ content_type: "text", text }] });
 
 // Environments: keep only the fields we show. The API also returns env_vars/secrets; never keep those.
 const slimEnv = (e) => ({ id: e.id, label: e.label ?? e.id, pinned: !!e.is_pinned, taskCount: e.task_count ?? 0,
   repos: Object.values(e.repo_map ?? {}).map((r) => r.repository_full_name).filter(Boolean) });
 
-function pickDefaultEnv(envs, repoName) {
+// Only environments that belong to this repo: a task in another repo's environment edits the wrong code.
+export function pickDefaultEnv(envs, repoName) {
   if (!envs.length) return null;
-  const matching = envs.filter((e) => e.matchesRepo);
-  const pool = matching.length ? matching : envs;
-  return pool.find((e) => repoName && e.label.toLowerCase() === repoName.toLowerCase())
-    ?? (pool.length === 1 ? pool[0] : null)
-    ?? pool.find((e) => e.pinned)
-    ?? [...pool].sort((a, b) => b.taskCount - a.taskCount)[0];
+  return envs.find((e) => repoName && e.label.toLowerCase() === repoName.toLowerCase())
+    ?? (envs.length === 1 ? envs[0] : null)
+    ?? envs.find((e) => e.pinned)
+    ?? [...envs].sort((a, b) => b.taskCount - a.taskCount)[0];
+}
+
+// GET /wham/models -> listable models in the server's priority order.
+export function modelsFromResponse(j) {
+  return (j?.models ?? [])
+    .filter((m) => m?.slug && m.visibility === "list")
+    .sort((a, b) => (a.priority ?? 999) - (b.priority ?? 999))
+    .map((m) => ({ id: m.slug, name: m.display_name || m.slug, ...(m.description ? { description: m.description } : {}) }));
+}
+
+// The body the Codex desktop app sends to create a GitHub environment (research-codex.md §9). No env
+// vars or secrets: users add those on chatgpt.com if they need them.
+export function environmentBody({ repoId, fullName, label, setup }) {
+  return {
+    label, description: `Created by megha for ${fullName}`,
+    machine_id: "wham-public/wham-universal", repos: [repoId],
+    github_connector_id: GITHUB_CONNECTOR_ID, workspace_dir: "/workspace",
+    agent_network_access: { mode: "on", preset_allowlist: "all", allowlist_domains: "" },
+    setup, maintenance_setup: [], env_vars: {}, secrets_with_domains: [],
+    share_settings: "workspace", share_targets: [], auto_setup_settings: { use_auto_setup: false },
+    cache_settings: { post_setup_cache_enabled: true, cache_invalidation_key: "" }, enable_authtranslator: false,
+  };
 }
 
 // `/bin/bash -lc "..."` -> the inner command, for display.
@@ -97,115 +138,271 @@ function turnDiff(turn) {
 export class CodexBackend {
   name = "codex";
   label = "Codex Cloud";
-  #envCache = new Map(); // repoKey -> {at, envs}
+  title = "Megha · Codex Cloud";
+  commands = [
+    { name: "pr", description: "Open a GitHub pull request from the latest cloud diff (add \"draft\" for a draft PR)", input: { hint: "draft" } },
+    { name: "apply", description: "Apply the latest cloud diff to this checkout" },
+    { name: "open", description: "Link to this task on chatgpt.com" },
+    { name: "status", description: "Show the cloud task's status" },
+  ];
 
   checkAuth() { readAuth(); }
   webUrl(id) { return taskUrl(id); }
 
+  async #models() {
+    return cachedList("models-codex", 10 * 60_000, async () =>
+      modelsFromResponse(await api("GET", `/wham/models?client_version=${CLIENT_VERSION}`, undefined, { signal: AbortSignal.timeout(5000) })), FALLBACK_MODELS);
+  }
+
+  // Environments for this repo (by-repo lookup only). Slim records are safe to cache on disk.
   async #environments(repo) {
-    const key = repo?.github ? `${repo.github.owner}/${repo.github.name}` : "";
-    const hit = this.#envCache.get(key);
-    if (hit && Date.now() - hit.at < 10 * 60_000) return hit.envs;
-    const byId = new Map();
-    if (repo?.github) {
-      try {
-        for (const e of await api("GET", `/wham/environments/by-repo/github/${enc(repo.github.owner)}/${enc(repo.github.name)}`)) {
-          byId.set(e.id, { ...slimEnv(e), matchesRepo: true });
-        }
-      } catch (e) { if (e instanceof UserError) throw e; log(`by-repo lookup failed: ${e.message}`); }
-    }
-    for (const e of await api("GET", "/wham/environments")) if (!byId.has(e.id)) byId.set(e.id, { ...slimEnv(e), matchesRepo: false });
-    const envs = [...byId.values()].sort((a, b) => (b.matchesRepo - a.matchesRepo) || (b.pinned - a.pinned) || a.label.localeCompare(b.label));
-    this.#envCache.set(key, { at: Date.now(), envs });
+    if (!repo?.github) return [];
+    const key = `envs-codex-${repo.github.owner}-${repo.github.name}`.toLowerCase().replace(/[^a-z0-9_.-]+/g, "_");
+    const hit = readCache(key, 2 * 60_000);
+    if (hit?.fresh && Array.isArray(hit.value)) return hit.value;
+    const envs = (await api("GET", `/wham/environments/by-repo/github/${enc(repo.github.owner)}/${enc(repo.github.name)}`)).map(slimEnv)
+      .sort((a, b) => (b.pinned - a.pinned) || a.label.localeCompare(b.label));
+    writeCache(key, envs);
     return envs;
+  }
+
+  // Is the repo visible to the ChatGPT GitHub connector (so an environment can be created for it)?
+  async #connectorRepo(repo) {
+    const full = `${repo.github.owner}/${repo.github.name}`;
+    const q = new URLSearchParams({ query: repo.github.name, limit: "20", page: "1", connector_id: GITHUB_CONNECTOR_ID });
+    const r = await api("GET", `/wham/github/repositories/search/all-installations?${q}`);
+    const hit = (r.repositories ?? []).find((x) => x.repository_full_name?.toLowerCase() === full.toLowerCase());
+    return hit?.id ? { repoId: hit.id, fullName: hit.repository_full_name } : null;
   }
 
   // session/new: no cloud task, just local defaults + option lists.
   async prepare(session) {
+    // T3 waits on this for every probe and new thread: run the model list, git and env lookups side by side.
+    const settle = (p) => p.then((v) => ({ v }), (e) => ({ e }));
+    const modelsP = settle(this.#models());
     session.repo = await repoInfo(session.cwd);
+    const repo = session.repo;
+    const localP = settle(session.config?.localChanges ? Promise.resolve(null) : localChanges(session.cwd, repo));
     let envs = [];
-    try { envs = await this.#environments(session.repo); } catch (e) { if (e instanceof UserError) throw e; log(`environment list failed: ${e.message}`); }
+    session.envProblem = !repo.isRepo ? "no-git" : !repo.github ? "no-github" : null;
+    session.creatable = null;
+    if (repo.github) {
+      try { envs = await this.#environments(repo); } catch (e) { if (e instanceof UserError) throw e; log(`environment lookup failed: ${e.message}`); session.envProblem = "lookup-failed"; }
+      if (!envs.length && !session.envProblem) {
+        try { session.creatable = await this.#connectorRepo(repo); session.envProblem = session.creatable ? null : "not-visible"; }
+        catch (e) { if (e instanceof UserError) throw e; log(`connector lookup failed: ${e.message}`); session.envProblem = "lookup-failed"; }
+      }
+    }
     session.envs = envs;
+    const models = await modelsP;
+    if (models.e) throw models.e;
+    session.models = models.v;
     const cfg = session.config ?? (session.config = {});
-    if (!cfg.environment || !envs.some((e) => e.id === cfg.environment)) cfg.environment = pickDefaultEnv(envs, session.repo.github?.name)?.id ?? "none";
+    const createValue = session.creatable ? `create:${session.creatable.fullName}` : null;
+    if (!cfg.environment || !(envs.some((e) => e.id === cfg.environment) || cfg.environment === createValue)) {
+      cfg.environment = pickDefaultEnv(envs, repo.github?.name)?.id ?? createValue ?? "none";
+    }
+    cfg.model ??= session.models.some((m) => m.id === DEFAULT_MODEL) ? DEFAULT_MODEL : session.models[0]?.id ?? DEFAULT_MODEL;
     cfg.mode ??= "code";
     cfg.apply ??= "off";
-    cfg.localChanges ??= "off";
+    const local = await localP;
+    if (!cfg.localChanges) cfg.localChanges = local.v?.any ? "on" : "off";
   }
 
   configOptions(session) {
     const cfg = session.config;
-    const envOptions = (session.envs ?? []).map((e) => ({
-      value: e.id, name: e.label,
-      description: `${e.repos.join(", ") || "no repos"}${e.matchesRepo ? " (this repo)" : ""}`,
-    }));
-    if (!envOptions.some((o) => o.value === cfg.environment)) {
-      envOptions.unshift({ value: cfg.environment, name: cfg.environment === "none" ? "No environment (create one at chatgpt.com/codex)" : cfg.environment });
+    const envOptions = (session.envs ?? []).map((e) => ({ value: e.id, name: e.label, description: e.repos.join(", ") || "no repos" }));
+    if (session.creatable) {
+      const setup = setupCommandsFor(session.repo?.root);
+      envOptions.push({ value: `create:${session.creatable.fullName}`, name: `Create environment for ${session.creatable.fullName}`,
+        description: `Created on first prompt. Setup: ${setup.join(" && ") || "none"}` });
     }
+    if (!envOptions.some((o) => o.value === cfg.environment)) {
+      envOptions.unshift({ value: cfg.environment, name: cfg.environment === "none" ? this.#noEnvLabel(session) : cfg.environment });
+    }
+    const models = (session.models ?? FALLBACK_MODELS).map((m) => ({ value: m.id, name: m.name, ...(m.description ? { description: m.description } : {}) }));
+    if (!models.some((m) => m.value === cfg.model)) models.unshift({ value: cfg.model, name: cfg.model });
     return [
-      { id: "environment", name: "Environment", description: "Codex Cloud environment the task runs in.", type: "select", currentValue: cfg.environment, options: envOptions },
-      { id: "mode", name: "Mode", category: "mode", description: "Code makes changes; Ask only answers.", type: "select", currentValue: cfg.mode,
-        options: [{ value: "code", name: "Code" }, { value: "ask", name: "Ask" }] },
+      // Sent as metadata.model_slug exactly like the Codex app, but on 2026-10-14 every cloud turn still
+      // reported model_version gpt-5.6-sol (tried gpt-5.6-luna and gpt-6.1-sol).
+      { id: "model", name: "Model", category: "model", description: "Requested from Codex Cloud; it may still run its default model.", type: "select", currentValue: cfg.model, options: models },
+      { id: "environment", name: "Environment", description: "Codex Cloud environment for this repo.", type: "select", currentValue: cfg.environment, options: envOptions },
+      { id: "mode", name: "Mode", category: "mode", description: "Code makes changes; Ask and Plan only answer.", type: "select", currentValue: cfg.mode,
+        options: [{ value: "code", name: "Code" }, { value: "ask", name: "Ask" }, { value: "plan", name: "Plan", description: "Ask mode, asked for a plan" }] },
       { id: "apply", name: "Apply diff locally", description: "Apply the cloud diff to this checkout at the end of each turn (git apply, never forced).", type: "select", currentValue: cfg.apply,
         options: [{ value: "off", name: "Off" }, { value: "on", name: "On" }] },
-      { id: "localChanges", name: "Send local changes", description: "Send `git diff origin/<branch>` (unpushed and uncommitted tracked changes) as the task's starting patch.", type: "select", currentValue: cfg.localChanges,
+      { id: "localChanges", name: "Send local changes", description: "Send commits not on origin and uncommitted tracked changes as the task's starting patch.", type: "select", currentValue: cfg.localChanges,
         options: [{ value: "off", name: "Off" }, { value: "on", name: "On" }] },
     ];
   }
 
   setConfig(session, id, value) {
-    const allowed = { environment: null, mode: ["code", "ask"], apply: ["off", "on"], localChanges: ["off", "on"] };
+    const allowed = { environment: null, model: null, mode: MODES, apply: ["off", "on"], localChanges: ["off", "on"] };
     if (!(id in allowed)) throw new UserError(`Unknown config option ${id}`);
     if (allowed[id] && !allowed[id].includes(value)) throw new UserError(`Invalid value ${value} for ${id}`);
+    if (id === "model" && !/^[\w.:-]+$/.test(value)) throw new UserError(`Invalid model ${value}`);
     session.config[id] = value;
   }
 
-  // ---------- prompt ----------
-  async prompt(session, text, io) {
+  #noEnvLabel(session) {
+    switch (session.envProblem) {
+      case "no-git": return "No environment: not a git repo";
+      case "no-github": return "No environment: no GitHub remote";
+      case "not-visible": return "No environment: repo not visible to Codex";
+      default: return "No environment for this repo";
+    }
+  }
+
+  #noEnvMessage(session) {
+    const repo = session.repo ?? {};
+    const full = repo.github ? `${repo.github.owner}/${repo.github.name}` : null;
+    const claude = "Megha · Claude Cloud can run it without that: it uploads a git bundle of your local repo.";
+    switch (session.envProblem) {
+      case "no-git": return `Codex Cloud runs on a GitHub repo, and ${session.cwd} is not a git repository. Run \`git init\`, commit, then \`gh repo create --source . --push\`, and retry. ${claude}`;
+      case "no-github": return `This repo has no GitHub remote (origin), and Codex Cloud clones from GitHub. Run \`gh repo create --source . --push\` (or add a GitHub origin and push), then retry. ${claude}`;
+      case "not-visible": return `The ChatGPT Codex connector can't see ${full}. Give it access to the repo (connect GitHub at https://chatgpt.com/codex/settings/environments, or GitHub Settings > Applications > ChatGPT Codex Connector > Configure), then retry. ${claude}`;
+      default: return `No Codex Cloud environment for ${full ?? "this repo"}. Create one at https://chatgpt.com/codex/settings/environments, then pick it in the Environment option.`;
+    }
+  }
+
+  async #ensureEnvironment(session, io) {
     const cfg = session.config;
+    if (cfg.environment && cfg.environment !== "none" && !cfg.environment.startsWith("create:")) return cfg.environment;
+    if (!cfg.environment?.startsWith("create:") || !session.creatable) throw new UserError(this.#noEnvMessage(session));
+    const repo = session.repo;
+    const setup = setupCommandsFor(repo.root);
+    const created = await api("POST", "/wham/environments", environmentBody({ ...session.creatable, label: repo.github.name, setup }));
+    if (!created?.id) throw new Error("Codex Cloud created an environment but returned no id");
+    const env = slimEnv(created);
+    if (!env.repos.length) env.repos = [session.creatable.fullName];
+    session.envs = [env];
+    session.creatable = null;
+    session.envProblem = null;
+    cfg.environment = env.id;
+    writeCache(`envs-codex-${repo.github.owner}-${repo.github.name}`.toLowerCase().replace(/[^a-z0-9_.-]+/g, "_"), [env]);
+    log(`created environment ${env.id}`);
+    io.update({ sessionUpdate: "config_option_update", configOptions: this.configOptions(session) });
+    io.text(`Created the Codex Cloud environment "${env.label}" for ${env.repos[0]} (setup: ${setup.join(" && ") || "none"}). Change it at https://chatgpt.com/codex/settings/environments.\n\n`);
+    return env.id;
+  }
+
+  // ChatGPT file upload, as the desktop app does for composer images: create entry -> PUT the bytes
+  // to the returned blob URL -> mark uploaded. The upload URL embeds a signed credential: never log it.
+  async #uploadImage(img, index) {
+    const bytes = Buffer.from(img.data, "base64");
+    const size = imageSize(bytes) ?? { width: 1, height: 1 };
+    const entry = await api("POST", "/files", { file_name: `image-${index + 1}.${imageExtension(img.mimeType)}`, file_size: bytes.length, use_case: "codex",
+      timezone_offset_min: new Date().getTimezoneOffset(), reset_rate_limits: false });
+    if (!entry?.file_id || !entry.upload_url) throw new Error("Codex Cloud returned no upload slot for an image");
+    const url = new URL(entry.upload_url, WEB);
+    let res;
+    if (url.pathname.endsWith("/estuary/upload_content_bytes")) {
+      const form = new FormData();
+      form.append("file", new Blob([bytes], { type: img.mimeType }), `image-${index + 1}.${imageExtension(img.mimeType)}`);
+      const h = authHeaders(); res = await fetch(url, { method: "POST", headers: h, body: form, redirect: "error" });
+    } else {
+      const target = url.href.toLowerCase().includes("estuary") ? url.searchParams.get("upload_url") : url.href;
+      if (!target) throw new Error("Codex Cloud image upload URL is missing its blob target");
+      res = await fetch(target, { method: "PUT", body: bytes, redirect: "error",
+        headers: { "Content-Type": img.mimeType, "x-ms-blob-type": "BlockBlob", "x-ms-version": "2020-04-08", "x-ms-blob-content-type": img.mimeType } });
+    }
+    if (!res.ok) throw new Error(`Codex Cloud image upload failed: HTTP ${res.status}`);
+    await res.text().catch(() => {});
+    try { await api("POST", `/files/${enc(entry.file_id)}/uploaded`, {}); } catch (e) { log(`image finalize failed: ${e.message}`); }
+    const id = entry.file_id;
+    return { type: "image_asset_pointer", asset_pointer: id.startsWith("file_") ? `sediment://${id}` : `file-service://${id}`, width: size.width, height: size.height, size_bytes: bytes.length };
+  }
+
+  async #imageItems(images, io) {
+    const items = [];
+    for (const [i, img] of images.entries()) items.push(await this.#uploadImage(img, i));
+    if (items.length) io.text(`Sent ${items.length} image${items.length === 1 ? "" : "s"} with the prompt.\n\n`);
+    return items;
+  }
+
+  // ---------- prompt ----------
+  async prompt(session, input, io) {
+    const cfg = session.config;
+    if (input.isContinue && session.cloudId) {
+      const r = await this.#continueTurn(session, io);
+      if (r) return r;
+    }
+    const text = cfg.mode === "plan" ? PLAN_PREFIX + input.text : input.text;
+    const metadata = cfg.model ? { metadata: { model_slug: cfg.model } } : {};
     let turnId;
     if (!session.cloudId) {
-      if (!cfg.environment || cfg.environment === "none") {
-        throw new UserError("No Codex Cloud environment is set up for this repo. Create one at https://chatgpt.com/codex/settings/environments, then pick it in the Environment option.");
-      }
+      const environmentId = await this.#ensureEnvironment(session, io);
       const repo = session.repo ?? (session.repo = await repoInfo(session.cwd));
       let branch = repo.branch;
+      const sendLocal = cfg.localChanges === "on" && repo.isRepo;
       if (!branch || !repo.branchSha) {
         branch = repo.defaultBranch;
-        io.text(`Note: ${repo.branch ? `branch \`${repo.branch}\` is not on origin` : "no current branch"}, so the cloud task starts from \`${branch}\`. Push your branch to run on it.\n\n`);
+        io.text(`Note: ${repo.branch ? `branch \`${repo.branch}\` is not on origin` : "no current branch"}, so the cloud task starts from \`${branch}\`${sendLocal ? " with your local changes applied" : ". Push your branch, or turn on \"Send local changes\""}.\n\n`);
       }
-      const input_items = [{ type: "message", role: "user", content: [{ content_type: "text", text }] }];
-      if (cfg.localChanges === "on" && repo.isRepo) {
-        const d = await git(session.cwd, ["diff", "--no-color", `origin/${branch}`]);
-        if (d.code === 0 && d.stdout.trim()) {
-          input_items.push({ type: "pre_apply_patch", output_diff: { diff: d.stdout } });
-          io.text(`Sending your local changes as the starting patch (${diffFiles(d.stdout).length} files vs origin/${branch}; untracked files are not included).\n\n`);
+      const input_items = [message(text), ...(await this.#imageItems(input.images, io))];
+      if (sendLocal) {
+        const info = await localChanges(session.cwd, repo);
+        const patch = await localPatch(session.cwd, info);
+        if (patch.trim()) {
+          input_items.push({ type: "pre_apply_patch", output_diff: { diff: patch } });
+          io.text(`Sending your local changes as the starting patch (${diffFiles(patch).length} files; ${info.unpushed} commit${info.unpushed === 1 ? "" : "s"} not on origin, ${info.dirty.length} uncommitted; untracked files are not included).\n\n`);
         }
       }
-      const res = await api("POST", "/wham/tasks", { new_task: { environment_id: cfg.environment, branch, run_environment_in_qa_mode: cfg.mode === "ask" }, input_items });
+      const res = await api("POST", "/wham/tasks", { new_task: { environment_id: environmentId, branch, run_environment_in_qa_mode: cfg.mode !== "code" }, ...metadata, input_items });
       session.cloudId = res?.task?.id ?? res?.id;
       if (!session.cloudId) throw new Error("Codex Cloud created a task but returned no id");
       session.webUrl = taskUrl(session.cloudId);
       session.title = res?.task?.title ?? session.title;
       saveSessionRecord(session);
-      log(`created task ${session.cloudId}`);
+      log(`created task ${session.cloudId} (model ${cfg.model})`);
       turnId = typeof res?.turn?.id === "string" && res.turn.id.includes("assttrn") ? res.turn.id : await this.#waitForNewTurn(session.cloudId, null, io.signal);
     } else {
       const before = await api("GET", `/wham/tasks/${enc(session.cloudId)}`);
       const prev = before.task?.current_turn_id ?? session.turnId;
       const res = await api("POST", "/wham/tasks", {
-        follow_up: { task_id: session.cloudId, turn_id: prev, environment_mode: cfg.mode === "ask" ? "ask" : "code" },
-        input_items: [{ type: "message", role: "user", content: [{ content_type: "text", text }] }],
+        follow_up: { task_id: session.cloudId, turn_id: prev, environment_mode: cfg.mode === "code" ? "code" : "ask" },
+        ...metadata, input_items: [message(text), ...(await this.#imageItems(input.images, io))],
       });
       turnId = typeof res?.turn?.id === "string" && res.turn.id.includes("assttrn") && res.turn.id !== prev ? res.turn.id : await this.#waitForNewTurn(session.cloudId, prev, io.signal);
     }
+    if (!turnId) {
+      // Cancelled before the cloud reported the new turn: cancel the task's running turn and stop.
+      try { await api("POST", `/wham/tasks/${enc(session.cloudId)}/cancel`); log("cancel requested"); } catch (e) { log(`cancel failed: ${e.message}`); }
+      return "cancelled";
+    }
     session.turnId = turnId;
     saveSessionRecord(session);
-
     const result = await this.#streamTurn(session, turnId, io);
-    if (session.title) io.update({ sessionUpdate: "session_info_update", title: session.title, updatedAt: new Date().toISOString() });
+    return this.#afterTurn(session, result, io);
+  }
 
-    if (result.status === "completed") await this.#finishDiff(session, result.turn, io);
+  // T3's automatic "Continue where you left off." after a restart: if the cloud turn is still running,
+  // follow it; if it finished while nobody watched, show its result. Otherwise it is a normal prompt.
+  async #continueTurn(session, io) {
+    const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`);
+    const turn = d.current_assistant_turn;
+    if (!turn?.id) return null;
+    session.title = d.task?.title ?? session.title;
+    session.webUrl ??= taskUrl(session.cloudId);
+    if (!TERMINAL.has(turn.turn_status)) {
+      log(`reattaching to running turn ${turn.id}`);
+      session.turnId = turn.id;
+      return this.#afterTurn(session, await this.#streamTurn(session, turn.id, io), io);
+    }
+    if (turn.id === session.doneTurnId) return null;
+    log(`showing turn ${turn.id} that finished while detached`);
+    session.turnId = turn.id;
+    io.text("The cloud turn finished while T3 Code was away. Its result:\n\n");
+    const st = new TurnState(session, io, turn.id, { replay: true });
+    st.catchUp(turn.thread_events?.events ?? []);
+    if (!st.sawText) for (const m of turnMessages(turn)) st.text(m);
+    return this.#afterTurn(session, { status: turn.turn_status, error: turn.error?.message }, io);
+  }
+
+  async #afterTurn(session, result, io) {
+    if (session.title) io.update({ sessionUpdate: "session_info_update", title: session.title, updatedAt: new Date().toISOString() });
+    if (result.status === "completed") await this.#finishDiff(session, io);
+    if (TERMINAL.has(result.status)) session.doneTurnId = session.turnId;
     io.text(`\n\n[Open in Codex Cloud](${session.webUrl})`);
     saveSessionRecord(session);
     if (result.status === "cancelled" || io.signal.aborted) return "cancelled";
@@ -220,6 +417,7 @@ export class CodexBackend {
       if (id && id !== previous && id.includes("assttrn")) return id;
       await sleep(1000, signal);
     }
+    if (signal?.aborted) return null;
     throw new Error("Codex Cloud did not start a turn within 60 s");
   }
 
@@ -266,7 +464,8 @@ export class CodexBackend {
       const startedAt = Date.now();
       let cancelDeadline = null;
       while (!finished) {
-        await sleep(POLL_MS, ac.signal);
+        // A cancel wakes the poller, which then polls faster so the background wind-down ends soon.
+        await sleep(io.signal.aborted ? 2000 : POLL_MS, io.signal.aborted ? ac.signal : AbortSignal.any([ac.signal, io.signal]));
         if (finished) return;
         if (io.signal.aborted) cancelDeadline ??= Date.now() + 30_000;
         try {
@@ -294,37 +493,97 @@ export class CodexBackend {
     st.closeSetup();
     log(`turn ${finished?.status} via ${finished?.via ?? "?"}`);
     const status = io.signal.aborted && finished?.status !== "completed" ? "cancelled" : finished?.status ?? "failed";
-    return { status, error: finished?.error, turn: null };
+    return { status, error: finished?.error };
   }
 
-  async #finishDiff(session, _turn, io) {
+  async #latestDiff(session) {
+    const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`);
+    session.title = d.task?.title ?? session.title;
+    // The PR endpoint wants the turn that holds the diff.
+    const diffTurn = turnDiff(d.current_diff_task_turn) ? d.current_diff_task_turn : turnDiff(d.current_assistant_turn) ? d.current_assistant_turn : null;
+    return { diff: turnDiff(diffTurn), turnId: diffTurn?.id ?? session.turnId,
+      stats: d.task?.task_status_display?.latest_turn_status_display?.diff_stats, task: d.task };
+  }
+
+  async #finishDiff(session, io) {
     // The diff lands in output_items once the turn is done; it can lag turn/completed a little.
-    let diff = null;
+    let latest = null;
     for (let i = 0; i < 4; i++) {
-      const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`);
-      session.title = d.task?.title ?? session.title;
-      diff = turnDiff(d.current_diff_task_turn) ?? turnDiff(d.current_assistant_turn);
-      const stats = d.task?.task_status_display?.latest_turn_status_display?.diff_stats;
-      if (diff || !(stats?.files_modified > 0)) break;
+      latest = await this.#latestDiff(session);
+      if (latest.diff || !(latest.stats?.files_modified > 0)) break;
       await sleep(2000);
     }
+    const diff = latest?.diff;
     if (!diff) return;
     io.update(diffToolCall({ toolCallId: `diff:${session.turnId}`, diff, cwd: session.cwd }));
+    const n = diffFiles(diff).length;
     if (session.config.apply === "on") {
       const r = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${session.turnId.split("~").pop()}`, previousFile: session.appliedPatchFile });
       if (r.ok && !r.unchanged) session.appliedPatchFile = r.patchFile;
-      io.text(`\n\n${r.message}`);
+      io.text(`\n\n${r.message} Type /pr to open a pull request.`);
     } else {
-      io.text(`\n\nThe cloud produced a diff (${diffFiles(diff).length} files). Turn on "Apply diff locally" to apply it here, or open the task to create a PR.`);
+      io.text(`\n\nThe cloud produced a diff (${n} file${n === 1 ? "" : "s"}). Type /apply to apply it here, or /pr to open a pull request.`);
     }
   }
 
-  async cancel() { /* handled through the prompt's abort signal */ }
+  // ---------- megha's slash commands ----------
+  async command(session, { name, args }, io) {
+    if (name === "open") { io.text(session.webUrl ? `[Open in Codex Cloud](${session.webUrl})` : "No cloud task yet: send a prompt first."); return; }
+    if (!session.cloudId) { io.text("No cloud task yet: send a prompt first."); return; }
+    switch (name) {
+      case "status": {
+        const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`);
+        const t = d.current_assistant_turn ?? {};
+        const disp = d.task?.task_status_display ?? {};
+        const st = disp.latest_turn_status_display?.diff_stats;
+        io.text([`**${d.task?.title ?? "Cloud task"}**`, `Status: ${t.turn_status ?? disp.latest_turn_status_display?.turn_status ?? "unknown"}`,
+          `Environment: ${disp.environment_label ?? session.config.environment}`, `Branch: ${disp.branch_name ?? t.branch ?? "?"}`,
+          `Model: ${t.model_version ?? session.config.model}`, ...(st ? [`Diff: ${st.files_modified ?? 0} files (+${st.lines_added ?? 0} -${st.lines_removed ?? 0})`] : []),
+          ...(session.prUrl ? [`Pull request: ${session.prUrl}`] : []), `[Open in Codex Cloud](${session.webUrl})`].join("\n"));
+        return;
+      }
+      case "apply": {
+        const { diff, turnId } = await this.#latestDiff(session);
+        if (!diff) { io.text("The cloud task has no diff to apply yet."); return; }
+        const r = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${String(turnId).split("~").pop()}`, previousFile: session.appliedPatchFile });
+        if (r.ok && !r.unchanged) session.appliedPatchFile = r.patchFile;
+        saveSessionRecord(session);
+        io.text(r.message);
+        return;
+      }
+      case "pr": {
+        if (session.prUrl) {
+          const linked = await linkPullRequest(session.t3, session.prUrl);
+          io.text(`This task already has a pull request: ${session.prUrl}${linked ? `\n\n${linked}` : ""}`);
+          return;
+        }
+        const { diff, turnId, task } = await this.#latestDiff(session);
+        const existing = findPullRequestUrl(task?.external_pull_requests);
+        if (existing) session.prUrl = existing;
+        else {
+          if (!diff) { io.text("The cloud task has no diff yet, so there is nothing to open a pull request from."); return; }
+          const res = await api("POST", `/wham/tasks/${enc(session.cloudId)}/turns/${enc(turnId)}/pr`, args === "draft" ? { mode: "draft" } : {});
+          session.prUrl = findPullRequestUrl(res);
+          for (let i = 0; i < 5 && !session.prUrl; i++) {
+            await sleep(2000);
+            const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`);
+            session.prUrl = findPullRequestUrl(d.task?.external_pull_requests) ?? findPullRequestUrl(d.task?.pull_requests);
+          }
+        }
+        saveSessionRecord(session);
+        if (!session.prUrl) { io.text(`Codex Cloud accepted the pull request request, but no PR link came back yet. Check the task: ${session.webUrl}`); return; }
+        const linked = await linkPullRequest(session.t3, session.prUrl);
+        io.text(`Opened ${session.prUrl}${linked ? `\n\n${linked}` : ""}`);
+        return;
+      }
+      default: io.text(`Unknown command /${name}`);
+    }
+  }
 
   // ---------- list / load ----------
   async list(cwd, cursor) {
     const repo = await repoInfo(cwd);
-    const labels = new Set((await this.#environments(repo)).filter((e) => e.matchesRepo).map((e) => e.label));
+    const labels = new Set((await this.#environments(repo)).map((e) => e.label));
     if (!labels.size) return { sessions: [] };
     // /wham/tasks/list ignores environment_id (checked live), and list items carry only the env label,
     // so page through and keep tasks whose environment belongs to this repo.
@@ -374,6 +633,7 @@ export class CodexBackend {
       const diff = turnDiff(turn);
       if (diff) updates.push(diffToolCall({ toolCallId: `diff:${node.id}`, diff, cwd: session.cwd }));
       session.turnId = node.id;
+      if (TERMINAL.has(turn.turn_status)) session.doneTurnId = node.id;
     }
     if (session.title) updates.push({ sessionUpdate: "session_info_update", title: session.title });
     for (const u of updates) io.update(u);
@@ -391,7 +651,7 @@ function turnMessages(turn) {
 }
 
 // Maps codex app-server v2 notifications (thread_events) to ACP session updates for one turn.
-class TurnState {
+export class TurnState {
   constructor(session, io, turnId, { replay = false } = {}) {
     this.session = session; this.io = io; this.turnId = turnId; this.replay = replay;
     this.deltaItems = new Set(); this.doneItems = new Set(); this.startedTools = new Set();
@@ -510,10 +770,7 @@ class TurnState {
     this.closeSetup();
     if (item.type === "agentMessage") { if (!this.deltaItems.has(item.id)) this.text(item.text); return; }
     if (item.type === "reasoning") { if (!this.deltaItems.has(item.id)) this.thought((item.summary ?? []).join("\n\n")); return; }
-    if (item.type === "userMessage") {
-      if (this.replay) return; // user prompts come from the user turn's input_items
-      return;
-    }
+    if (item.type === "userMessage") return; // user prompts come from the user turn's input_items
     const tool = this.toolFor(item);
     if (!tool) return;
     const { failed, ...rest } = tool;
