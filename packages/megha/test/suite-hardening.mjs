@@ -25,34 +25,34 @@ const text = (t) => [{ type: "text", text: t }];
 const notesText = (conn, sessionId) => conn.notes.filter((n) => n.sessionId === sessionId && n.update.sessionUpdate === "agent_message_chunk").map((n) => n.update.content.text).join("");
 const errOf = (p) => p.then(() => null, (e) => e);
 const stderrSince = (i) => stdio.err.slice(i).join("");
-async function until(cond, ms = 4000) {
+export async function until(cond, ms = 4000) {
   const end = Date.now() + ms;
   while (!cond()) { if (Date.now() > end) throw new Error("condition not reached in time"); await wait(20); }
 }
 
 // ---------- Codex fakes ----------
-const codexEnv = (id, label, full, extra = {}) => ({ id, label, repo_map: { r: { repository_full_name: full } }, ...extra });
-function codexBase(byRepo, extra = []) {
+export const codexEnv = (id, label, full, extra = {}) => ({ id, label, repo_map: { r: { repository_full_name: full } }, ...extra });
+export function codexBase(byRepo, extra = []) {
   return [...extra,
     ["GET", new RegExp(`^${CX}/wham/models$`), () => json({ models: [{ slug: "gpt-5.6-sol", display_name: "Sol", visibility: "list", priority: 1 }, { slug: "gpt-b", display_name: "B", visibility: "list", priority: 2 }] })],
     ["GET", new RegExp(`^${CX}/wham/environments/by-repo/github/`), () => json(byRepo)],
   ];
 }
-const details = (id, env, { turn = `${id}~assttrn_e_1`, status = "completed", output_items = [] } = {}) =>
+export const details = (id, env, { turn = `${id}~assttrn_e_1`, status = "completed", output_items = [] } = {}) =>
   ({ task: { id, title: "t", current_turn_id: turn }, current_assistant_turn: { id: turn, turn_status: status, output_items, environment_id: env.id, environment: env } });
-const thread = (method, params = {}) => ({ item_type: "thread_event", event: { method, params } });
-const doneStream = (t) => sse([thread("turn/started"), thread("item/agentMessage/delta", { itemId: "m1", delta: t }), thread("turn/completed", { turn: { status: "completed" } })]);
+export const thread = (method, params = {}) => ({ item_type: "thread_event", event: { method, params } });
+export const doneStream = (t) => sse([thread("turn/started"), thread("item/agentMessage/delta", { itemId: "m1", delta: t }), thread("turn/completed", { turn: { status: "completed" } })]);
 
 // ---------- Claude fakes ----------
-function claudeBase(extra = []) {
+export function claudeBase(extra = []) {
   return [...extra,
     ["GET", new RegExp(`^${AN}/v1/environment_providers$`), () => json({ environments: [{ environment_id: "env_cloud", name: "Default", kind: "anthropic_cloud" }] })],
     ["GET", new RegExp(`^${AN}/v1/models$`), () => json({ data: [{ id: "claude-opus-5-5", display_name: "Claude Opus 5.5" }, { id: "claude-haiku-5-5", display_name: "Claude Haiku 5.5" }] })],
   ];
 }
-const crow = (seq, payload) => ({ event: "client_event", id: String(seq), data: { sequence_num: String(seq), source: "worker", payload } });
+export const crow = (seq, payload) => ({ event: "client_event", id: String(seq), data: { sequence_num: String(seq), source: "worker", payload } });
 // An SSE body that only sends keepalive comments until aborted, like a session whose container never starts.
-function keepaliveSse(signal) {
+export function keepaliveSse(signal) {
   const body = new ReadableStream({
     start(c) {
       const t = setInterval(() => { try { c.enqueue(new TextEncoder().encode(":keepalive\n\n")); } catch {} }, 50);
@@ -65,7 +65,7 @@ function keepaliveSse(signal) {
 
 // A work repo whose "GitHub" origin is a local bare repo (git url.<bare>.insteadOf), so ls-remote,
 // fetch and push work offline while megha still sees a github.com remote.
-async function githubLikeRepo(full) {
+export async function githubLikeRepo(full) {
   const bare = tmp("bare");
   await git(bare, ["init", "-q", "--bare", "-b", "main"]);
   const work = await makeRepo({ origin: `https://github.com/${full}.git`, files: { "a.txt": "one\n" } });
@@ -74,7 +74,7 @@ async function githubLikeRepo(full) {
   if (p.code !== 0) throw new Error(`push failed: ${p.stderr}`);
   return { bare, work };
 }
-async function pushOutcomeBranch(work, branch, content) {
+export async function pushOutcomeBranch(work, branch, content) {
   await git(work, ["checkout", "-qb", "megha-test-tmp"]);
   writeFileSync(join(work, "a.txt"), content);
   await git(work, ["commit", "-qam", "cloud change"]);
@@ -83,7 +83,7 @@ async function pushOutcomeBranch(work, branch, content) {
   await git(work, ["checkout", "-q", "main"]);
   await git(work, ["branch", "-qD", "megha-test-tmp"]);
 }
-const readA = (dir) => readFileSync(join(dir, "a.txt"), "utf8").replace(/\r\n/g, "\n");
+export const readA = (dir) => readFileSync(join(dir, "a.txt"), "utf8").replace(/\r\n/g, "\n");
 
 export async function run({ root }) {
   // ======================= 1. attachments =======================
@@ -467,18 +467,21 @@ export async function run({ root }) {
 
   await test("F6 claude: the turn deadline fires even while the stream only sends keepalives", async () => {
     const repo = await makeRepo({ origin: null });
-    mockFetch(claudeBase([
+    const calls = mockFetch(claudeBase([
       ["POST", new RegExp(`^${AN}/v1/code/sessions/cse_f6b/events$`), () => json({ results: [{ sequence_num: "3" }] })],
       ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_f6b/events/stream$`), (req) => keepaliveSse(req.signal)],
       ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_f6b$`), () => json({ session: { id: "cse_f6b", worker_status: "running" } })],
     ]));
-    const be = new ClaudeBackend({ statusPollMs: 60_000, turnTimeoutMs: 400 });
+    // Since round 2 the deadline also interrupts the cloud session and watches for its result (at
+    // most stopWaitMs) before the turn fails.
+    const be = new ClaudeBackend({ statusPollMs: 60_000, turnTimeoutMs: 400, stopWaitMs: 300 });
     const s = { id: "mg_f6b", cwd: repo, config: {} };
     await be.prepare(s);
     Object.assign(s, { cloudId: "cse_f6b", bundle: true, repoChecked: true, sentMode: s.config.mode, sentModel: s.config.model });
     const e = await errOf(Promise.race([be.prompt(s, cleanPrompt(text("hi")), recorder().io), wait(5000).then(() => "hung")]));
     assert.ok(e instanceof Error, `ended with an error, got ${e}`);
     assert.match(e.message, /timed out/);
+    assert.ok(calls.some((c) => c.method === "POST" && c.body?.events?.[0]?.payload?.request?.subtype === "interrupt"), "the deadline interrupted the cloud session");
   });
 
   await test("F6 codex: a poll request that stalls does not keep a finished turn pending", async () => {

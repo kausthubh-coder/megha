@@ -34,12 +34,12 @@ if (!["codex", "claude"].includes(backendName ?? "")) {
 }
 
 const acp = await import("@agentclientprotocol/sdk");
-const { log, setLogPrefix, migrateLegacyStore } = await import("./lib/util.mjs");
+const { log, setLogPrefix, migrateLegacyStore, describeError } = await import("./lib/util.mjs");
 const { MeghaAgent } = await import("./lib/agent.mjs");
 const backend = backendName === "codex" ? new (await import("./lib/codex.mjs")).CodexBackend() : new (await import("./lib/claude.mjs")).ClaudeBackend();
 
 setLogPrefix(`megha:${backendName}`);
-try { migrateLegacyStore(); } catch (e) { log(`session migration failed: ${e.message}`); }
+try { migrateLegacyStore(); } catch (e) { log(`session migration failed: ${describeError(e)}`); }
 const stream = acp.ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin));
 const conn = new acp.AgentSideConnection((c) => new MeghaAgent(c, backend, { version: VERSION }), stream);
 conn.closed?.then?.(() => process.exit(0));

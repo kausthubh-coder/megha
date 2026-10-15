@@ -7,7 +7,7 @@ import { join, posix } from "node:path";
 import {
   log, sleep, sseFrames, tail, repoInfo, UserError, isoFromEpochSeconds, saveSessionRecord, cleanTerminal,
   cachedList, readCache, writeCache, localChanges, localPatch, setupCommandsFor, findPullRequestUrl,
-  CloudError, operationLabel, parseJsonBody, throwIfCancelled, boundedSignal,
+  CloudError, operationLabel, parseJsonBody, throwIfCancelled, boundedSignal, Cancelled, describeError, turnFailed,
 } from "./util.mjs";
 import { codexChangesToPatch, diffToolCall, applyLocally, diffFiles } from "./diff.mjs";
 import { imageSize, imageExtension } from "./image.mjs";
@@ -68,6 +68,25 @@ const KNOWN_ERROR_CODES = {
   task_not_found: "The task no longer exists on Codex Cloud.",
   model_not_found: "That model is not available; pick another in the Model option.",
 };
+// Codex app-server turn error kinds (TurnError.codexErrorInfo; a plain code on wham's turn.error),
+// named in megha's failure message. turn.error.message is never shown: it is the cloud's own text.
+const TURN_ERROR_CODES = {
+  usageLimitExceeded: "Your Codex usage limit is reached; see chatgpt.com/codex.",
+  contextWindowExceeded: "The conversation no longer fits the model's context window; start a new task.",
+  internalServerError: null, unauthorized: null, badRequest: null, sandboxError: null,
+  httpConnectionFailed: null, responseStreamConnectionFailed: null, responseStreamDisconnected: null, responseTooManyFailedAttempts: null,
+  ...KNOWN_ERROR_CODES,
+};
+export function turnErrorCode(err) {
+  if (!err || typeof err !== "object") return null;
+  for (let c of [err.codexErrorInfo, err.codex_error_info, err.code]) {
+    if (c && typeof c === "object" && !Array.isArray(c)) c = Object.keys(c)[0]; // { httpConnectionFailed: {...} }
+    if (typeof c === "string" && Object.hasOwn(TURN_ERROR_CODES, c)) return c;
+  }
+  return null;
+}
+const turnFailure = (code, url) => turnFailed(LABEL, { code, url, guidance: code && TURN_ERROR_CODES[code] ? `${TURN_ERROR_CODES[code]} (${url})` : null });
+
 function knownError(text) {
   let j; try { j = JSON.parse(text); } catch { return {}; }
   for (const c of [j?.detail?.code, j?.error?.code, j?.error?.type, j?.code]) {
@@ -184,8 +203,12 @@ export class CodexBackend {
     { name: "status", description: "Show the cloud task's status" },
   ];
 
-  // pollMs: how often a running turn is polled (tests shorten it).
-  constructor({ pollMs = POLL_MS } = {}) { this.pollMs = pollMs; }
+  // pollMs: how often a running turn is polled; turnTimeoutMs: the hard limit for one turn, after
+  // which megha cancels it in the cloud; stopWaitMs: how long a stopped turn (Stop or the limit) is
+  // watched for its terminal status. Tests shorten them.
+  constructor({ pollMs = POLL_MS, turnTimeoutMs = 3 * 3600_000, stopWaitMs = 30_000 } = {}) {
+    Object.assign(this, { pollMs, turnTimeoutMs, stopWaitMs });
+  }
 
   checkAuth() { readAuth(); }
   webUrl(id) { return taskUrl(id); }
@@ -237,8 +260,25 @@ export class CodexBackend {
     this.#checkTask(session, await api("GET", `/wham/tasks/${enc(session.cloudId)}`));
   }
 
+  // true when Codex Cloud accepted the cancel. Never throws.
   async #cancelTask(session) {
-    try { await api("POST", `/wham/tasks/${enc(session.cloudId)}/cancel`); log("cancel requested"); } catch (e) { log(`cancel failed: ${e.message}`); }
+    try { await api("POST", `/wham/tasks/${enc(session.cloudId)}/cancel`); log("cancel requested"); return true; }
+    catch (e) { log(`cancel failed: ${describeError(e)}`); return false; }
+  }
+  // Cancel right away (a turn stopped before megha streamed it). If the cloud didn't accept, the next
+  // follow-up checks the turn first.
+  async #cancelNow(session) {
+    if (!(await this.#cancelTask(session))) session.stopUnconfirmed = true;
+  }
+
+  // A turn megha stopped without confirmation (the cancel request failed and no terminal status came
+  // in time) may still be running, and a follow-up would land on top of it. Before one is sent: if
+  // the task's turn is still going, ask again and refuse; once it is terminal, carry on.
+  async #ensureStopped(session, details) {
+    const status = details?.current_assistant_turn?.turn_status;
+    if (!status || TERMINAL.has(status)) { session.stopUnconfirmed = false; return; }
+    const ok = await this.#cancelTask(session);
+    throw new UserError(`The previous Codex Cloud turn hasn't confirmed it stopped; megha ${ok ? "asked" : "tried to ask"} Codex Cloud to cancel it again. Try again in a moment, or stop it at ${session.webUrl ?? taskUrl(session.cloudId)}.`);
   }
 
   // Is the repo visible to the ChatGPT GitHub connector (so an environment can be created for it)?
@@ -262,10 +302,10 @@ export class CodexBackend {
     session.envProblem = !repo.isRepo ? "no-git" : !repo.github ? "no-github" : null;
     session.creatable = null;
     if (repo.github) {
-      try { envs = await this.#environments(repo); } catch (e) { if (e instanceof UserError) throw e; log(`environment lookup failed: ${e.message}`); session.envProblem = "lookup-failed"; }
+      try { envs = await this.#environments(repo); } catch (e) { if (e instanceof UserError) throw e; log(`environment lookup failed: ${describeError(e)}`); session.envProblem = "lookup-failed"; }
       if (!envs.length && !session.envProblem) {
         try { session.creatable = await this.#connectorRepo(repo); session.envProblem = session.creatable ? null : "not-visible"; }
-        catch (e) { if (e instanceof UserError) throw e; log(`connector lookup failed: ${e.message}`); session.envProblem = "lookup-failed"; }
+        catch (e) { if (e instanceof UserError) throw e; log(`connector lookup failed: ${describeError(e)}`); session.envProblem = "lookup-failed"; }
       }
     }
     session.envs = envs;
@@ -391,7 +431,8 @@ export class CodexBackend {
     }
     await res.text().catch(() => {}); // the blob service's reply is never shown or logged
     if (!res.ok) throw new CloudError({ label: LABEL, operation: "image upload", status: res.status });
-    try { await api("POST", `/files/${enc(entry.file_id)}/uploaded`, {}); } catch (e) { log(`image finalize failed: ${e.message}`); }
+    throwIfCancelled(signal); // the upload may have finished after Stop: don't mark it uploaded
+    try { await api("POST", `/files/${enc(entry.file_id)}/uploaded`, {}); } catch (e) { log(`image finalize failed: ${describeError(e)}`); }
     const id = entry.file_id;
     return { type: "image_asset_pointer", asset_pointer: id.startsWith("file_") ? `sediment://${id}` : `file-service://${id}`, width: size.width, height: size.height, size_bytes: bytes.length };
   }
@@ -443,13 +484,15 @@ export class CodexBackend {
       session.webUrl = taskUrl(session.cloudId);
       session.title = res?.task?.title ?? session.title;
       session.repoChecked = true; // created in an environment checked against this repo just above
+      session.createdIn = session.cwd;
       saveSessionRecord(session);
       log(`created task ${session.cloudId} (model ${cfg.model})`);
-      if (signal.aborted) { await this.#cancelTask(session); return "cancelled"; }
+      if (signal.aborted) { await this.#cancelNow(session); return "cancelled"; }
       turnId = typeof res?.turn?.id === "string" && res.turn.id.includes("assttrn") ? res.turn.id : await this.#waitForNewTurn(session.cloudId, null, signal);
     } else {
       const before = await api("GET", `/wham/tasks/${enc(session.cloudId)}`, undefined, { signal });
       this.#checkTask(session, before);
+      if (session.stopUnconfirmed) await this.#ensureStopped(session, before);
       const prev = before.task?.current_turn_id ?? session.turnId;
       const images = await this.#imageItems(input.images, io);
       throwIfCancelled(signal);
@@ -457,12 +500,12 @@ export class CodexBackend {
         follow_up: { task_id: session.cloudId, turn_id: prev, environment_mode: cfg.mode === "code" ? "code" : "ask" },
         ...metadata, input_items: [message(text), ...images],
       }, { timeoutMs: 60_000 });
-      if (signal.aborted) { await this.#cancelTask(session); return "cancelled"; }
+      if (signal.aborted) { await this.#cancelNow(session); return "cancelled"; }
       turnId = typeof res?.turn?.id === "string" && res.turn.id.includes("assttrn") && res.turn.id !== prev ? res.turn.id : await this.#waitForNewTurn(session.cloudId, prev, signal);
     }
     if (!turnId) {
       // Cancelled before the cloud reported the new turn: cancel the task's running turn and stop.
-      await this.#cancelTask(session);
+      await this.#cancelNow(session);
       return "cancelled";
     }
     session.turnId = turnId;
@@ -492,18 +535,22 @@ export class CodexBackend {
     const st = new TurnState(session, io, turn.id, { replay: true });
     st.catchUp(turn.thread_events?.events ?? []);
     st.fallbackMessages(turnMessages(turn));
-    return this.#afterTurn(session, { status: turn.turn_status, error: turn.error?.message }, io);
+    return this.#afterTurn(session, { status: turn.turn_status, code: turnErrorCode(turn.error) }, io);
   }
 
+  // result: {status, error?: an Error megha made, code?: an allowlisted turn error code}.
   async #afterTurn(session, result, io) {
+    session.webUrl ??= taskUrl(session.cloudId);
     if (session.title) io.update({ sessionUpdate: "session_info_update", title: session.title, updatedAt: new Date().toISOString() });
     // After Stop nothing more happens locally: no diff fetch, no automatic apply.
-    if (result.status === "completed" && !io.signal.aborted) await this.#finishDiff(session, io);
+    if (result.status === "completed" && !io.signal.aborted) {
+      try { await this.#finishDiff(session, io); } catch (e) { if (!(e instanceof Cancelled)) throw e; }
+    }
     if (TERMINAL.has(result.status)) session.doneTurnId = session.turnId;
     io.text(`\n\n[Open in Codex Cloud](${session.webUrl})`);
     saveSessionRecord(session);
     if (result.status === "cancelled" || io.signal.aborted) return "cancelled";
-    if (result.status === "failed") throw new Error(`Codex Cloud turn failed: ${result.error ?? "unknown error"} (${session.webUrl})`);
+    if (result.status === "failed") throw result.error ?? turnFailure(result.code, session.webUrl);
     return "end_turn";
   }
 
@@ -522,16 +569,27 @@ export class CodexBackend {
   // Live SSE for the turn plus a 5 s GET poll (the stream can stay open and silent once a turn is done).
   async #streamTurn(session, turnId, io) {
     const st = new TurnState(session, io, turnId);
-    const ac = new AbortController();
+    const ac = new AbortController(); // aborts once the turn has an outcome: ends the stream and the poller
     let finished = null;
     const finish = (r) => { if (!finished) { finished = r; ac.abort(); } };
-    let cancelSent = false;
-    const onAbort = async () => {
-      if (cancelSent) return; cancelSent = true;
-      await this.#cancelTask(session);
+    // Stop and the turn's time limit end a turn the same way: ask the cloud to cancel it, then keep
+    // watching for the terminal status for at most stopWaitMs. The cancel request belongs to the turn
+    // (io.turn.track): the next prompt waits for its answer, even if the stream reports the end first.
+    let stopping = null, cancelRequest = null, stopTimer = null;
+    const wake = new AbortController();
+    const stop = (reason) => {
+      if (stopping || finished) return;
+      stopping = reason;
+      log(reason === "timeout" ? "turn time limit reached; cancelling it in the cloud" : "stopping the cloud turn");
+      cancelRequest = io.turn.track(this.#cancelTask(session), "cloud cancel");
+      stopTimer = setTimeout(() => finish({ status: "cancelled", unconfirmed: true }), this.stopWaitMs);
+      wake.abort();
     };
+    const onAbort = () => stop("cancel");
     io.signal.addEventListener("abort", onAbort, { once: true });
     if (io.signal.aborted) onAbort();
+    // The limit fires on its own timer, so neither a busy stream nor a slow poll can postpone it.
+    const deadline = setTimeout(() => stop("timeout"), this.turnTimeoutMs);
 
     const streamer = (async () => {
       let gotEvents = false;
@@ -552,20 +610,17 @@ export class CodexBackend {
           }
         } catch (e) {
           if (finished || ac.signal.aborted) return;
-          log(`stream error (${e.message}); reconnecting`);
+          log(`stream error (${describeError(e)}); reconnecting`);
         }
         await sleep(2000, ac.signal);
       }
     })();
 
     const poller = (async () => {
-      const startedAt = Date.now();
-      let cancelDeadline = null;
       while (!finished) {
-        // A cancel wakes the poller, which then polls faster so the background wind-down ends soon.
-        await sleep(io.signal.aborted ? Math.min(2000, this.pollMs) : this.pollMs, io.signal.aborted ? ac.signal : AbortSignal.any([ac.signal, io.signal]));
+        // A stop wakes the poller, which then polls faster so the wind-down ends soon.
+        await sleep(stopping ? Math.min(2000, this.pollMs) : this.pollMs, stopping ? ac.signal : AbortSignal.any([ac.signal, wake.signal]));
         if (finished) return;
-        if (io.signal.aborted) cancelDeadline ??= Date.now() + 30_000;
         try {
           // ac.signal: the turn finishing (via the stream) aborts a poll still in flight.
           const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`, undefined, { signal: ac.signal });
@@ -577,26 +632,32 @@ export class CodexBackend {
             if (finished) return;
             st.catchUp(turn.thread_events?.events ?? []);
             st.fallbackMessages(turnMessages(turn));
-            finish({ status: turn.turn_status, error: turn.error?.message, via: "poll" });
+            finish({ status: turn.turn_status, code: turnErrorCode(turn.error), via: "poll" });
             return;
           }
         } catch (e) {
           if (finished) return;
-          if (e instanceof UserError) { finish({ status: "failed", error: e.message }); return; }
-          log(`poll failed: ${e.message}`);
+          if (e instanceof UserError) { finish({ status: "failed", error: e }); return; }
+          log(`poll failed: ${describeError(e)}`);
         }
-        if (cancelDeadline && Date.now() > cancelDeadline) { finish({ status: "cancelled" }); return; }
-        if (Date.now() - startedAt > 3 * 3600_000) { finish({ status: "failed", error: "timed out after 3 h" }); return; }
       }
     })();
 
-    await Promise.race([streamer, poller]);
     await Promise.allSettled([streamer, poller]);
+    clearTimeout(deadline);
+    clearTimeout(stopTimer);
     io.signal.removeEventListener("abort", onAbort);
     st.closeSetup();
-    log(`turn ${finished?.status} via ${finished?.via ?? "?"}`);
+    log(`turn ${finished?.status} via ${finished?.via ?? "?"}${finished?.unconfirmed ? " (stop not confirmed)" : ""}`);
+    // Stopped, the cloud never confirmed it and the cancel request failed: the turn may still run, so
+    // the next follow-up checks it first (#ensureStopped).
+    if (cancelRequest) io.turn.track(cancelRequest.then((ok) => { session.stopUnconfirmed = !ok && !!finished?.unconfirmed; }), "cloud cancel");
+    if (stopping === "timeout" && finished?.status !== "completed") {
+      const limit = `${Math.round(this.turnTimeoutMs / 60_000)} min`;
+      return { status: "failed", error: turnFailed(LABEL, { guidance: `It timed out after ${limit}, so megha asked Codex Cloud to cancel it (${session.webUrl ?? taskUrl(session.cloudId)}).` }) };
+    }
     const status = io.signal.aborted && finished?.status !== "completed" ? "cancelled" : finished?.status ?? "failed";
-    return { status, error: finished?.error };
+    return { status, error: finished?.error, code: finished?.code };
   }
 
   async #latestDiff(session, signal) {
@@ -623,7 +684,7 @@ export class CodexBackend {
     const n = diffFiles(diff).length;
     if (session.config.apply === "on") {
       throwIfCancelled(io.signal);
-      const r = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${session.turnId.split("~").pop()}`, previousFile: session.appliedPatchFile });
+      const r = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${session.turnId.split("~").pop()}`, previousFile: session.appliedPatchFile, signal: io.signal });
       if (r.ok && !r.unchanged) session.appliedPatchFile = r.patchFile;
       io.text(`\n\n${r.message} Type /pr to open a pull request.`);
     } else {
@@ -653,7 +714,7 @@ export class CodexBackend {
         const { diff, turnId } = await this.#latestDiff(session, io.signal);
         if (!diff) { io.text("The cloud task has no diff to apply yet."); return; }
         throwIfCancelled(io.signal);
-        const r = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${String(turnId).split("~").pop()}`, previousFile: session.appliedPatchFile });
+        const r = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${String(turnId).split("~").pop()}`, previousFile: session.appliedPatchFile, signal: io.signal });
         if (r.ok && !r.unchanged) session.appliedPatchFile = r.patchFile;
         saveSessionRecord(session);
         io.text(r.message);
@@ -675,7 +736,7 @@ export class CodexBackend {
           session.prUrl = findPullRequestUrl(res);
           for (let i = 0; i < 5 && !session.prUrl && !io.signal.aborted; i++) {
             await sleep(2000, io.signal);
-            const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`);
+            const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`, undefined, { signal: io.signal });
             session.prUrl = findPullRequestUrl(d.task?.external_pull_requests) ?? findPullRequestUrl(d.task?.pull_requests);
           }
         }
@@ -713,7 +774,7 @@ export class CodexBackend {
       let d;
       try { d = await api("GET", `/wham/tasks/${enc(t.id)}`); } catch (e) {
         if (e instanceof UserError) throw e; // signed out: say so instead of listing nothing
-        log(`list: could not check a task (${e.message})`);
+        log(`list: could not check a task (${describeError(e)})`);
         return null;
       }
       try { this.#checkTask({ ...probe }, d); return t; } catch { return null; } // another repo's task
@@ -747,7 +808,7 @@ export class CodexBackend {
         continue;
       }
       if (!turn.thread_events && !turn.output_items) {
-        try { turn = (await api("GET", `/wham/tasks/${enc(session.cloudId)}/turns/${enc(node.id)}`)).turn ?? turn; } catch (e) { log(`turn fetch failed: ${e.message}`); }
+        try { turn = (await api("GET", `/wham/tasks/${enc(session.cloudId)}/turns/${enc(node.id)}`)).turn ?? turn; } catch (e) { log(`turn fetch failed: ${describeError(e)}`); }
       }
       const st = new TurnState(session, collect, node.id, { replay: true });
       st.catchUp(turn.thread_events?.events ?? []);
@@ -789,8 +850,9 @@ export class TurnState {
     // itemId -> the text of that message/reasoning item shown so far. A stream can drop after a
     // prefix; the stored complete item then supplies only the missing rest.
     this.shown = new Map();
+    this.textItems = new Set(); // ids of agentMessage items (answer text, as opposed to reasoning)
     this.answer = ""; // all answer text shown this turn
-    this.messageDone = false; // a complete agentMessage item was seen
+    this.errorCode = null; // allowlisted code of a non-retried `error` event (never its message)
     this.remoteCwd = null;
     this.setup = null; // {id, lines}
   }
@@ -799,25 +861,40 @@ export class TurnState {
   #emit(kind, t) { if (kind === "text") this.text(t); else this.thought(t); }
   #delta(itemId, t, kind) {
     if (!t) return;
+    if (kind === "text") this.textItems.add(itemId);
     this.shown.set(itemId, (this.shown.get(itemId) ?? "") + t);
     this.#emit(kind, t);
   }
   // The complete text of an item: show what the stream did not.
   #complete(itemId, full, kind) {
     if (!full) return;
+    if (kind === "text") this.textItems.add(itemId);
     const shown = this.shown.get(itemId) ?? "";
     if (!shown) this.#emit(kind, full);
     else if (full.startsWith(shown)) this.#emit(kind, full.slice(shown.length));
     // else the streamed text differs from the stored text; keep what was shown rather than repeat it.
     this.shown.set(itemId, full);
   }
-  // Last resort when the stored events hold no complete message: the turn's output_items messages.
+  // The turn's output_items messages, for whatever the stream and the stored events didn't show. Each
+  // message is reconciled on its own (a completed commentary message says nothing about the final
+  // answer): one already shown is skipped, one a streamed item only began gets the rest of its text,
+  // and one never seen is shown whole.
   fallbackMessages(messages) {
-    if (this.messageDone) return;
-    const all = messages.filter(Boolean).join("\n\n");
-    if (!all) return;
-    if (!this.answer) this.text(all);
-    else if (all.startsWith(this.answer)) this.text(all.slice(this.answer.length));
+    const flat = (t) => t.replace(/\s+/g, " ").trim();
+    for (const msg of messages.filter(Boolean)) {
+      if (flat(this.answer).includes(flat(msg))) continue;
+      const partial = [...this.textItems].find((id) => {
+        const shown = this.shown.get(id) ?? "";
+        return shown && !this.doneItems.has(id) && msg.startsWith(shown);
+      });
+      if (partial) {
+        this.text(msg.slice(this.shown.get(partial).length));
+        this.shown.set(partial, msg);
+        this.doneItems.add(partial);
+      } else {
+        this.text(this.answer && !/\s$/.test(this.answer) ? `\n\n${msg}` : msg);
+      }
+    }
   }
   // Cloud paths (/workspace/<repo>/...) -> paths in the local checkout.
   local(p) {
@@ -867,11 +944,12 @@ export class TurnState {
         if (!this.replay && typeof used === "number") this.io.update({ sessionUpdate: "usage_update", used, size: u.modelContextWindow ?? 0 });
         return null;
       }
-      case "error": if (p.willRetry === false || p.will_retry === false) this.lastError = p.error?.message ?? "error"; return null;
+      // The cloud's error text stays out: only an allowlisted kind is kept for the failure message.
+      case "error": if (p.willRetry === false || p.will_retry === false) this.errorCode = turnErrorCode(p.error) ?? this.errorCode; return null;
       case "turn/completed": {
         this.closeSetup();
         const s = p.turn?.status;
-        return { status: s === "interrupted" ? "cancelled" : s === "failed" ? "failed" : "completed", error: p.turn?.error?.message ?? this.lastError };
+        return { status: s === "interrupted" ? "cancelled" : s === "failed" ? "failed" : "completed", code: turnErrorCode(p.turn?.error) ?? this.errorCode };
       }
       default: return null;
     }
@@ -927,7 +1005,7 @@ export class TurnState {
     if (!item?.id || this.doneItems.has(item.id)) return;
     this.doneItems.add(item.id);
     this.closeSetup();
-    if (item.type === "agentMessage") { this.messageDone = true; this.#complete(item.id, item.text, "text"); return; }
+    if (item.type === "agentMessage") { this.#complete(item.id, item.text, "text"); return; }
     if (item.type === "reasoning") { this.#complete(item.id, (item.summary ?? []).join("\n\n"), "thought"); return; }
     if (item.type === "userMessage") return; // user prompts come from the user turn's input_items
     const tool = this.toolFor(item);

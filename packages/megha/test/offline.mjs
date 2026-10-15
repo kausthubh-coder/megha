@@ -20,12 +20,16 @@ delete process.env.T3_ACP_MCP_AUTHORIZATION;
 delete process.env.CODEX_CLOUD_TASKS_BASE_URL;
 delete process.env.CLAUDE_CLOUD_BASE_URL;
 
-const { writeFakeLogins, failed, teeStdio } = await import("./harness.mjs");
+const { writeFakeLogins, failed, teeStdio, instrument } = await import("./harness.mjs");
 teeStdio();
+instrument();
 const logins = writeFakeLogins(join(root, "logins"));
 const realFetch = globalThis.fetch;
+// `node test/offline.mjs suite-round2.mjs` runs only the named suites (while working on one).
+const ALL = ["suite-core.mjs", "suite-prompt.mjs", "suite-agent.mjs", "suite-codex.mjs", "suite-claude.mjs", "suite-hardening.mjs", "suite-round2.mjs", "suite-secrecy.mjs"];
+const only = process.argv.slice(2);
 try {
-  for (const suite of ["suite-core.mjs", "suite-prompt.mjs", "suite-agent.mjs", "suite-codex.mjs", "suite-claude.mjs", "suite-hardening.mjs", "suite-secrecy.mjs"]) {
+  for (const suite of only.length ? ALL.filter((s) => only.includes(s)) : ALL) {
     console.log(`\n# ${suite}`);
     await (await import(`./${suite}`)).run({ root, logins });
     globalThis.fetch = realFetch;

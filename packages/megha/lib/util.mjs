@@ -15,11 +15,13 @@ export function log(...parts) {
 }
 
 export const sleep = (ms, signal) => new Promise((resolve) => {
+  if (signal?.aborted) { resolve(); return; }
   const t = setTimeout(resolve, ms);
   signal?.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
 });
 
 export class UserError extends Error {}
+export class Cancelled extends Error { constructor() { super("cancelled"); this.name = "Cancelled"; } }
 
 // ---------- cloud API errors ----------
 // A failed cloud request. The message is built only from the HTTP status, a fixed operation label and
@@ -48,6 +50,27 @@ export function operationLabel(method, path) {
   const segs = String(path).split("?")[0].split("/").map((p) => (p && isIdSegment(p) ? "<id>" : p));
   return `${method} ${segs.join("/")}`;
 }
+// A cloud turn that ended in failure. Like a failed request, only an allowlisted code and fixed guidance
+// travel: the cloud's own error text (Codex turn.error.message and stream `error` events, Claude
+// result.result) can quote env vars, tokens or tool output.
+export function turnFailed(label, { code = null, guidance = null, url = null } = {}) {
+  return new CloudError({ label, operation: "turn", code, guidance: guidance ?? `Open it in the cloud to see why${url ? `: ${url}` : "."}` });
+}
+
+// The one way megha turns any caught error into text for stderr or for the ACP error T3 shows. Only
+// megha-made messages pass through as they are: UserError, CloudError and Cancelled (fixed text), and
+// plain `Error`s that megha throws with fixed text. Everything else is named by kind, never by message:
+// a SyntaxError quotes the response it failed on, and library errors can carry server text.
+export function describeError(e) {
+  if (e instanceof UserError || e instanceof CloudError || e instanceof Cancelled) return e.message;
+  if (e?.name === "AbortError" || e?.name === "TimeoutError") return "the request timed out or was stopped";
+  const code = (x) => (typeof x === "string" && /^[A-Z][A-Z0-9_]{1,40}$/.test(x) ? x : null);
+  if (e instanceof TypeError && e.cause) return `network error${code(e.cause.code) ? ` (${e.cause.code})` : ""}`;
+  if (code(e?.code)) return `system error (${e.code})`;
+  if (e instanceof Error && Object.getPrototypeOf(e) === Error.prototype) return e.message;
+  return `unexpected ${e instanceof Error ? e.name : "error"}`;
+}
+
 // Parse a JSON response body without letting the body reach an error message (SyntaxError messages
 // quote the input).
 export function parseJsonBody(text, label, operation) {
@@ -56,7 +79,6 @@ export function parseJsonBody(text, label, operation) {
 }
 
 // ---------- cancellation and request bounds ----------
-export class Cancelled extends Error { constructor() { super("cancelled"); this.name = "Cancelled"; } }
 // Call before every cloud or local mutation: a cancelled turn must not start new work.
 export function throwIfCancelled(signal) { if (signal?.aborted) throw new Cancelled(); }
 // The caller's signal (cancel, or the turn finished) plus a per-request timeout, so no request can
@@ -156,9 +178,20 @@ export function allSessionRecords(backend) {
 }
 const PERSISTED_KEYS = ["id", "backend", "cwd", "cloudId", "turnId", "doneTurnId", "lastSeq", "title", "webUrl", "config", "bundle",
   "outcomeBranch", "baseBranch", "baseSha", "appliedPatchFile", "sentMode", "sentModel", "prUrl", "createdAt", "updatedAt"];
+// Where megha created the session's cloud task: the folder of the session/new that sent its first
+// prompt. Set once, when megha creates the cloud task, and never rewritten. A bundle-seeded Claude
+// session names no repo in the cloud, so this is the only evidence of which checkout it belongs to;
+// `cwd` is just the folder the session is bound to now (a resume can rebind it). Always written, as
+// null when megha didn't create the task, so a record from before this field is recognizable.
+export function provenanceOf(rec) {
+  if (!rec) return null;
+  // A record from megha 0.1.0 has no createdIn: its cwd is the best evidence there is.
+  return Object.hasOwn(rec, "createdIn") ? rec.createdIn ?? null : rec.cwd ?? null;
+}
 export function saveSessionRecord(session) {
   const rec = {};
   for (const k of PERSISTED_KEYS) if (session[k] !== undefined) rec[k] = session[k];
+  rec.createdIn = session.createdIn ?? null;
   rec.updatedAt = new Date().toISOString();
   writeJsonAtomic(SESSIONS_DIR, fileFor(SESSIONS_DIR, session.id), rec);
   prune(SESSIONS_DIR, MAX_SESSIONS);
@@ -192,7 +225,7 @@ export function writeCache(name, value) {
     const file = join(dir, `${name}.json`);
     writeFileSync(`${file}.${process.pid}.tmp`, JSON.stringify({ at: Date.now(), value }));
     renameSync(`${file}.${process.pid}.tmp`, file);
-  } catch (e) { log(`cache write failed: ${e.message}`); }
+  } catch (e) { log(`cache write failed: ${describeError(e)}`); }
 }
 // Fresh cache -> it; else fetch (bounded) -> cache; fetch failure -> stale cache -> fallback.
 export async function cachedList(name, ttlMs, fetcher, fallback) {
@@ -203,24 +236,54 @@ export async function cachedList(name, ttlMs, fetcher, fallback) {
     if (Array.isArray(value) && value.length) { writeCache(name, value); return value; }
   } catch (e) {
     if (e instanceof UserError) throw e;
-    log(`${name} fetch failed: ${e.message}`);
+    log(`${name} fetch failed: ${describeError(e)}`);
   }
   return Array.isArray(hit?.value) && hit.value.length ? hit.value : fallback;
 }
 
 // ---------- git ----------
-export function git(cwd, args, { input, allowFail = true } = {}) {
+// Every git call is bounded. `timeoutMs` ends one that stalls (a hung ls-remote, fetch or credential
+// helper) with { code: -1, timedOut: true }; `signal` (the turn's Stop) ends it at once with Cancelled.
+// Either way megha kills only the git process it spawned, and answers without waiting for the pipes to
+// close (a helper git started may still hold them). Pass a signal only to commands that are safe to
+// kill: reads, fetches, bundle creation. A command that changes the checkout or a ref gets none; check
+// the signal before starting it instead. git's stderr can quote the remote ("remote: ..." lines), so
+// it is returned to the caller but never put in an error message.
+export const GIT_TIMEOUT_MS = 120_000;
+export const GIT_NETWORK_TIMEOUT_MS = 60_000;
+export function git(cwd, args, { input, allowFail = true, signal, timeoutMs = GIT_TIMEOUT_MS, network = false } = {}) {
+  if (signal?.aborted) return Promise.reject(new Cancelled());
   return new Promise((resolve, reject) => {
-    const child = spawn("git", args, { cwd, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    // A network call never waits on a terminal prompt nobody can see.
+    const env = network ? { ...process.env, GIT_TERMINAL_PROMPT: "0" } : process.env;
+    const child = spawn("git", args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     const out = []; const err = [];
+    let done = false;
+    const end = (fn) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      fn();
+    };
+    const kill = () => { try { child.kill(); } catch {} child.stdout.destroy(); child.stderr.destroy(); };
+    const onAbort = () => end(() => { kill(); reject(new Cancelled()); });
+    const timer = setTimeout(() => end(() => {
+      kill();
+      log(`git ${args[0]} gave no answer in ${Math.round(timeoutMs / 1000)} s; stopped it`);
+      if (allowFail) resolve({ code: -1, stdout: "", stderr: "", timedOut: true });
+      else reject(new Error(`git ${args[0]} timed out after ${Math.round(timeoutMs / 1000)} s`));
+    }), timeoutMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
     child.stdout.on("data", (d) => out.push(d));
     child.stderr.on("data", (d) => err.push(d));
-    child.on("error", (e) => (allowFail ? resolve({ code: -1, stdout: "", stderr: e.message }) : reject(e)));
-    child.on("close", (code) => {
+    child.stdin.on("error", () => {}); // EPIPE when git exits (or is killed) before reading its input
+    child.on("error", (e) => end(() => (allowFail ? resolve({ code: -1, stdout: "", stderr: e.message }) : reject(e))));
+    child.on("close", (code) => end(() => {
       const r = { code, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8") };
-      if (code !== 0 && !allowFail) reject(new Error(`git ${args[0]} failed: ${r.stderr.trim().slice(0, 300)}`));
+      if (code !== 0 && !allowFail) reject(new Error(`git ${args[0]} failed (exit ${code})`));
       else resolve(r);
-    });
+    }));
     if (input !== undefined) child.stdin.end(input); else child.stdin.end();
   });
 }

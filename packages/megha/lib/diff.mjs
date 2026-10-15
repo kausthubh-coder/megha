@@ -2,7 +2,7 @@
 
 import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join, isAbsolute } from "node:path";
-import { DATA_DIR, git, log } from "./util.mjs";
+import { DATA_DIR, git, log, Cancelled, throwIfCancelled } from "./util.mjs";
 
 const MAX_DIFF_CHARS = 400_000;
 
@@ -97,51 +97,64 @@ function savePatch(name, diff) {
 // Apply a cloud diff to cwd. Preflight with `git apply --check`; never force. If an earlier diff of this
 // session was applied and the cloud now reports a newer cumulative diff, swap it (reverse the old one,
 // apply the new one) and restore the old one if the new one does not apply.
-export async function applyLocally({ cwd, diff, name, previousFile }) {
+//
+// signal: the turn's Stop. The read-only git steps (rev-parse, the --check preflights, status) are
+// killed by it; each step that changes the working tree checks it right before it starts and is never
+// killed once running. A Stop after the previous diff was reversed puts it back, then throws
+// Cancelled, so a stopped turn leaves the checkout as it found it. `run` replaces git in tests.
+export async function applyLocally({ cwd, diff, name, previousFile, signal, run = git }) {
+  const read = (dir, args) => { throwIfCancelled(signal); return run(dir, args, { signal }); };
+  const change = (dir, args) => { throwIfCancelled(signal); return run(dir, args); };
   let previous = null;
   try { if (previousFile) previous = readFileSync(previousFile, "utf8"); } catch {}
   const patchFile = savePatch(name, diff);
-  const top = await git(cwd, ["rev-parse", "--show-toplevel"]);
+  const top = await read(cwd, ["rev-parse", "--show-toplevel"]);
   if (top.code !== 0) return { ok: false, message: `Not applied: ${cwd} is not a git repository. Patch saved to ${patchFile}.` };
   const root = top.stdout.trim();
   if (previous === diff) return { ok: true, patchFile, unchanged: true, message: "The cloud diff is unchanged since the last apply; nothing to do." };
 
-  let reversedPrevious = false;
+  let prevFile = null;
   if (previous) {
-    const prevFile = savePatch(`${name}-previous`, previous);
-    const rev = await git(root, ["apply", "-R", "--check", prevFile]);
+    const file = savePatch(`${name}-previous`, previous);
+    const rev = await read(root, ["apply", "-R", "--check", file]);
     if (rev.code === 0) {
-      await git(root, ["apply", "-R", prevFile]);
-      reversedPrevious = true;
+      if ((await change(root, ["apply", "-R", file])).code === 0) prevFile = file;
     } else {
       log("previous diff no longer reverses cleanly; applying the new diff on top");
     }
   }
+  // Put the reversed previous diff back (no signal: this undo must run to the end).
+  const restore = async () => { if (prevFile) await run(root, ["apply", prevFile]); };
 
-  const files = diffFiles(diff).map((f) => f.path);
-  const n = files.length;
-  const swapped = reversedPrevious ? ", replacing the previously applied diff" : "";
-  const check = await git(root, ["apply", "--check", patchFile]);
-  if (check.code === 0) {
-    // Applies cleanly: a plain apply touches only the working tree (no index changes).
-    const res = await git(root, ["apply", patchFile]);
-    if (res.code === 0) return { ok: true, patchFile, message: `Applied the cloud diff to your working tree (${n} file${n === 1 ? "" : "s"}${swapped}).` };
-  }
-  // Does not apply cleanly. Fall back to a 3-way merge, but only when the touched files have no local
-  // edits (--3way works through the index and we must not clobber unstaged work).
-  const failing = [...new Set([...check.stderr.matchAll(/error: (?:patch failed: )?([^:\n]+)/g)].map((m) => m[1].trim()))];
-  const dirty = (await git(root, ["status", "--porcelain", "--", ...files])).stdout.trim();
-  if (!dirty) {
-    const res = await git(root, ["apply", "--3way", patchFile]);
-    const conflicted = [...res.stderr.matchAll(/Applied patch to '([^']+)' with conflicts/g)].map((m) => m[1]);
-    if (res.code === 0) return { ok: true, patchFile, message: `Applied the cloud diff with a 3-way merge (${n} file${n === 1 ? "" : "s"}${swapped}).` };
-    if (conflicted.length) {
-      return { ok: false, message: `Applied with conflicts in ${conflicted.join(", ")}: resolve the conflict markers there (the changes are staged by git apply --3way). Patch saved to ${patchFile}.` };
+  try {
+    const files = diffFiles(diff).map((f) => f.path);
+    const n = files.length;
+    const swapped = prevFile ? ", replacing the previously applied diff" : "";
+    const check = await read(root, ["apply", "--check", patchFile]);
+    if (check.code === 0) {
+      // Applies cleanly: a plain apply touches only the working tree (no index changes).
+      const res = await change(root, ["apply", patchFile]);
+      if (res.code === 0) return { ok: true, patchFile, message: `Applied the cloud diff to your working tree (${n} file${n === 1 ? "" : "s"}${swapped}).` };
     }
+    // Does not apply cleanly. Fall back to a 3-way merge, but only when the touched files have no local
+    // edits (--3way works through the index and we must not clobber unstaged work).
+    const failing = [...new Set([...check.stderr.matchAll(/error: (?:patch failed: )?([^:\n]+)/g)].map((m) => m[1].trim()))];
+    const dirty = (await read(root, ["status", "--porcelain", "--", ...files])).stdout.trim();
+    if (!dirty) {
+      const res = await change(root, ["apply", "--3way", patchFile]);
+      const conflicted = [...res.stderr.matchAll(/Applied patch to '([^']+)' with conflicts/g)].map((m) => m[1]);
+      if (res.code === 0) return { ok: true, patchFile, message: `Applied the cloud diff with a 3-way merge (${n} file${n === 1 ? "" : "s"}${swapped}).` };
+      if (conflicted.length) {
+        return { ok: false, message: `Applied with conflicts in ${conflicted.join(", ")}: resolve the conflict markers there (the changes are staged by git apply --3way). Patch saved to ${patchFile}.` };
+      }
+    }
+    await restore();
+    return {
+      ok: false,
+      message: `Not applied: the cloud diff does not apply cleanly${failing.length ? ` (${failing.slice(0, 8).join(", ")})` : ""}${dirty ? " and the touched files have local edits" : ""}. Nothing was changed. Patch saved to ${patchFile}.`,
+    };
+  } catch (e) {
+    if (e instanceof Cancelled) { await restore(); log("apply stopped; the checkout is as it was"); }
+    throw e;
   }
-  if (reversedPrevious) await git(root, ["apply", savePatch(`${name}-previous`, previous)]);
-  return {
-    ok: false,
-    message: `Not applied: the cloud diff does not apply cleanly${failing.length ? ` (${failing.slice(0, 8).join(", ")})` : ""}${dirty ? " and the touched files have local edits" : ""}. Nothing was changed. Patch saved to ${patchFile}.`,
-  };
 }

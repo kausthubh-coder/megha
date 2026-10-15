@@ -10,7 +10,8 @@ import { join, resolve } from "node:path";
 import crypto from "node:crypto";
 import {
   log, sleep, sseFrames, tail, git, repoInfo, UserError, saveSessionRecord, allSessionRecords, cleanTerminal, cachedList, localChanges,
-  CloudError, operationLabel, parseJsonBody, throwIfCancelled, boundedSignal,
+  CloudError, operationLabel, parseJsonBody, throwIfCancelled, boundedSignal, Cancelled, describeError, turnFailed, provenanceOf,
+  GIT_NETWORK_TIMEOUT_MS,
 } from "./util.mjs";
 import { diffToolCall, applyLocally, diffFiles } from "./diff.mjs";
 
@@ -218,7 +219,15 @@ function sessionRepo(s) {
 const fullName = (repo) => (repo?.github ? `${repo.github.owner}/${repo.github.name}`.toLowerCase() : null);
 const samePath = (a, b) => !!a && !!b && (process.platform === "win32" ? resolve(a).toLowerCase() === resolve(b).toLowerCase() : resolve(a) === resolve(b));
 // Shown when the container never comes up. last_init_error itself is server text and is never shown.
-const STARTUP_FAILED = "Claude could not start the cloud session's container; open the session on claude.ai to see why";
+const STARTUP_FAILED = "Claude could not start the cloud session's container; open the session on claude.ai to see why.";
+// Claude Code SDK result subtypes named in megha's failure message. result.result is the cloud's own
+// text (it can quote tool output or env vars) and is never shown.
+const RESULT_ERRORS = {
+  error_during_execution: null,
+  error_max_budget_usd: "The session reached its spending limit.",
+  error_max_structured_output_retries: null,
+};
+const resultCode = (p) => (typeof p.subtype === "string" && Object.hasOwn(RESULT_ERRORS, p.subtype) ? p.subtype : null);
 
 export const compareUrl = (full, base, branch) => `https://github.com/${full}/compare/${enc(base)}...${enc(branch)}?expand=1`;
 
@@ -237,8 +246,10 @@ export class ClaudeBackend {
   // statusPollMs: how often a running turn checks the session for startup failures; turnTimeoutMs:
   // the hard limit for one turn; idleMs: reconnect a stream that sends no bytes (not even keepalives)
   // for this long. Tests shorten them.
-  constructor({ statusPollMs = 15_000, turnTimeoutMs = 3 * 3600_000, idleMs = 120_000 } = {}) {
-    Object.assign(this, { statusPollMs, turnTimeoutMs, idleMs });
+  // stopWaitMs: how long a stopped turn (Stop or the limit) is watched for its result after megha
+  // sends the interrupt.
+  constructor({ statusPollMs = 15_000, turnTimeoutMs = 3 * 3600_000, idleMs = 120_000, stopWaitMs = 30_000 } = {}) {
+    Object.assign(this, { statusPollMs, turnTimeoutMs, idleMs, stopWaitMs });
   }
 
   checkAuth() { readCredentials(); }
@@ -269,7 +280,7 @@ export class ClaudeBackend {
     for (const r of [envsR, modelsR, repoR]) if (r.e instanceof UserError) throw r.e;
     if (repoR.e) throw repoR.e;
     session.repo = repoR.v;
-    if (envsR.e) log(`environment list failed: ${envsR.e.message}`);
+    if (envsR.e) log(`environment list failed: ${describeError(envsR.e)}`);
     const envs = (envsR.v ?? []).filter((e) => e.kind !== "bridge");
     session.envs = envs;
     session.models = modelsR.v ?? FALLBACK_MODELS;
@@ -315,31 +326,76 @@ export class ClaudeBackend {
   }
 
   // Throws unless the session (GET /v1/code/sessions/{id}) works on this folder's repo. A GitHub
-  // session names its repo; a bundle-seeded one names none, so it must be one megha made in this folder.
+  // session names its repo; a bundle-seeded one names none, so it must be one megha created in this
+  // folder. That evidence is the record's createdIn, written once at creation: binding, settings and
+  // failed prompts rewrite `cwd`, never createdIn.
   #checkSession(session, s) {
     const full = fullName(session.repo);
     const theirs = sessionRepo(s);
     if (theirs) {
       if (theirs !== full) throw new UserError(`This Claude cloud session belongs to ${theirs}, not ${full ?? "this folder's repo"}, so megha won't open or continue it here.`);
-    } else if (!allSessionRecords("claude").some((r) => r.cloudId === session.cloudId && samePath(r.cwd, session.cwd))) {
+    } else if (!samePath(session.createdIn, session.cwd)
+      && !allSessionRecords("claude").some((r) => r.cloudId === session.cloudId && samePath(provenanceOf(r), session.cwd))) {
       throw new UserError("megha can't tell which repository this Claude cloud session came from (it was seeded from a git bundle, not made by megha in this folder), so it won't open or continue it here.");
     }
     session.repoChecked = true;
   }
 
+  // Before any network check (session/load and session/resume): a bundle session megha created in
+  // another folder is refused from its local record alone, so a check that can't run never lets it bind.
+  checkRecord(session) {
+    if (session.cloudId && session.bundle === true && session.createdIn && !samePath(session.createdIn, session.cwd)) {
+      throw new UserError("This Claude cloud session was seeded from a git bundle of another folder's repo, so megha won't open or continue it here.");
+    }
+  }
+
   // session/load and session/resume of a cloud id, and the first follow-up of a session megha did not
-  // create in this process: confirm the repo, and note the session's current startup error so only a
-  // new one fails the next turn.
+  // create in this process: confirm the repo, fill in what megha needs to know about the session, and
+  // note its current startup error so only a new one fails the next turn.
   async checkRepo(session, signal) {
     session.repo ??= await repoInfo(session.cwd);
     const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal }));
     this.#checkSession(session, s);
+    this.#hydrate(session, s);
     session.lastInitError = s.external_metadata?.last_init_error ?? null;
     return s;
   }
 
+  // What load and resume both need from the cloud's session object, without replaying history: its
+  // title and link, whether it was bundle-seeded, the branch it pushes, and where that branch started.
+  #hydrate(session, s) {
+    session.title = s.title ?? session.title;
+    session.webUrl ??= this.webUrl(session.cloudId);
+    const sources = s.config?.sources ?? s.session_context?.sources ?? [];
+    const outcome = (s.config?.outcomes ?? s.session_context?.outcomes ?? []).find((o) => o.type === "git_repository");
+    session.outcomeBranch ??= outcome?.git_info?.branches?.[0];
+    session.bundle ??= !sources.length;
+    // Where an imported GitHub session started: its source revision (a commit, or a branch), else the
+    // repo's default branch (web-created sources carry no revision). #branchDiff resolves the commit.
+    if (!session.bundle && !session.baseSha) {
+      const rev = sources.find((x) => x.type === "git_repository")?.revision;
+      if (typeof rev === "string" && /^[0-9a-f]{40}$/i.test(rev)) session.baseSha = rev.toLowerCase();
+      else session.baseBranch ??= (typeof rev === "string" && rev) || session.repo?.defaultBranch || null;
+    }
+  }
+
+  // true when the cloud accepted the interrupt. Never throws.
   async #interruptQuietly(session) {
-    try { await this.#interrupt(session); log("interrupt sent"); } catch (e) { log(`interrupt failed: ${e.message}`); }
+    try { await this.#interrupt(session); log("interrupt sent"); return true; }
+    catch (e) { log(`interrupt failed: ${describeError(e)}`); return false; }
+  }
+  async #interruptNow(session) {
+    if (!(await this.#interruptQuietly(session))) session.stopUnconfirmed = true;
+  }
+
+  // A turn megha stopped without confirmation (the interrupt failed and no result came in time) may
+  // still be running, and a new prompt would queue behind it. Before one is sent: if the session is
+  // still working, interrupt again and refuse; once it is idle, carry on.
+  async #ensureStopped(session, signal) {
+    const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal }));
+    if (s.worker_status !== "running" && s.worker_status !== "requires_action") { session.stopUnconfirmed = false; return; }
+    const ok = await this.#interruptQuietly(session);
+    throw new UserError(`The previous Claude cloud turn hasn't confirmed it stopped; megha ${ok ? "asked" : "tried to ask"} it to stop again. Try again in a moment, or stop it at ${session.webUrl ?? this.webUrl(session.cloudId)}.`);
   }
 
   // ---------- prompt ----------
@@ -356,9 +412,10 @@ export class ClaudeBackend {
     }
     if (!session.cloudId) {
       await this.#create(session, input, io);
-      if (signal.aborted) { await this.#interruptQuietly(session); return "cancelled"; }
+      if (signal.aborted) { await this.#interruptNow(session); return "cancelled"; }
     } else {
       if (!session.repoChecked) await this.checkRepo(session, signal);
+      if (session.stopUnconfirmed) await this.#ensureStopped(session, signal);
       const events = [];
       if (session.sentMode !== session.config.mode) events.push({ payload: { type: "control_request", request_id: `set-mode-${crypto.randomUUID()}`, request: { subtype: "set_permission_mode", mode: session.config.mode }, uuid: crypto.randomUUID() } });
       if (session.sentModel !== session.config.model) events.push({ payload: { type: "control_request", request_id: `set-model-${crypto.randomUUID()}`, request: { subtype: "set_model", model: session.config.model }, uuid: crypto.randomUUID() } });
@@ -369,23 +426,30 @@ export class ClaudeBackend {
       fromSeq = session.lastSeq ?? 0;
       session.sentMode = session.config.mode;
       session.sentModel = session.config.model;
-      if (signal.aborted) { await this.#interruptQuietly(session); return "cancelled"; }
+      if (signal.aborted) { await this.#interruptNow(session); return "cancelled"; }
     }
     if (input.images.length) io.text(`Sent ${input.images.length} image${input.images.length === 1 ? "" : "s"} with the prompt.\n\n`);
     const result = await this.#streamTurn(session, io, fromSeq, userSeq);
     return this.#afterTurn(session, result, io);
   }
 
+  // result: {status, error?: an Error megha made, code?: an allowlisted result subtype}.
   async #afterTurn(session, result, io) {
+    session.webUrl ??= this.webUrl(session.cloudId);
     saveSessionRecord(session);
     // After Stop nothing more happens locally: no branch fetch, no automatic apply.
-    if (result.status === "completed" && !io.signal.aborted) await this.#finishDiff(session, io);
+    if (result.status === "completed" && !io.signal.aborted) {
+      try { await this.#finishDiff(session, io); } catch (e) { if (!(e instanceof Cancelled)) throw e; }
+    }
     io.text(`\n\n[Open in Claude Code on the web](${session.webUrl})`);
     if (session.title) io.update({ sessionUpdate: "session_info_update", title: session.title, updatedAt: new Date().toISOString() });
     saveSessionRecord(session);
     if (result.status === "cancelled" || io.signal.aborted) return "cancelled";
     if (result.status === "max_turns") return "max_turn_requests";
-    if (result.status === "failed") throw new Error(`Claude cloud turn failed: ${result.error ?? "unknown error"} (${session.webUrl})`);
+    if (result.status === "failed") {
+      const known = result.code && RESULT_ERRORS[result.code];
+      throw result.error ?? turnFailed(LABEL, { code: result.code, url: session.webUrl, guidance: known ? `${known} (${session.webUrl})` : null });
+    }
     return "end_turn";
   }
 
@@ -415,7 +479,8 @@ export class ClaudeBackend {
     const refs = ["HEAD", ...(repo.branch ? [repo.branch] : [])];
     let ownRef = null, stashSha = null;
     if (withLocal) {
-      stashSha = (await git(session.cwd, ["stash", "create"])).stdout.trim();
+      // `stash create` only writes objects (no ref, no checkout change), so Stop may kill it.
+      stashSha = (await git(session.cwd, ["stash", "create"], { signal })).stdout.trim();
       if (stashSha) {
         throwIfCancelled(signal);
         const ref = `refs/seed/${Date.now()}-${crypto.randomBytes(8).toString("hex")}/stash`;
@@ -423,9 +488,11 @@ export class ClaudeBackend {
       }
     }
     let b;
-    try { b = await git(session.cwd, ["bundle", "create", file, ...refs]); }
+    // Stop may kill the bundle write (a temp file); the private ref is deleted either way, unkillably.
+    try { b = await git(session.cwd, ["bundle", "create", file, ...refs], { signal, timeoutMs: 10 * 60_000 }); }
+    catch (e) { rmSync(file, { force: true }); throw e; }
     finally { if (ownRef) await git(session.cwd, ["update-ref", "-d", ownRef, stashSha]); }
-    if (b.code !== 0) { rmSync(file, { force: true }); throw new Error(`git bundle create failed: ${b.stderr.trim().slice(0, 300)}`); }
+    if (b.code !== 0) { rmSync(file, { force: true }); throw new Error(`git bundle create failed (exit ${b.code})`); }
     let data = readFileSync(file); rmSync(file, { force: true });
     if (ownRef) data = relabelBundle(data, { [ownRef]: "refs/seed/stash" });
     if (data.length > 100 * 1024 * 1024) throw new UserError("The repo bundle is over 100 MB, which Claude cloud sessions do not accept.");
@@ -493,6 +560,7 @@ export class ClaudeBackend {
     session.sentMode = cfg.mode;
     session.sentModel = cfg.model;
     session.repoChecked = true; // made here, from this folder's repo
+    session.createdIn = session.cwd; // the evidence #checkSession needs for a bundle session; set only here
     session.lastInitError = null; // a new session: any startup error is this turn's
     saveSessionRecord(session);
     log(`created session ${session.cloudId}${session.bundle ? " (bundle)" : ""} (model ${cfg.model})`);
@@ -504,20 +572,26 @@ export class ClaudeBackend {
 
   async #streamTurn(session, io, fromSeq, userSeq) {
     const st = new ClaudeTurn(session, io);
-    const ac = new AbortController();
+    const ac = new AbortController(); // aborts once the turn has an outcome: ends the stream and the poller
     let finished = null;
     const finish = (r) => { if (!finished) { finished = r; ac.abort(); } };
-    let interruptSent = false;
     const timers = [];
-    const onAbort = async () => {
-      if (interruptSent) return; interruptSent = true;
-      await this.#interruptQuietly(session);
-      timers.push(setTimeout(() => finish({ status: "cancelled" }), 30_000).unref());
+    // Stop and the turn's time limit end a turn the same way: interrupt the cloud session, then keep
+    // reading for its result for at most stopWaitMs. The interrupt request belongs to the turn
+    // (io.turn.track): the next prompt waits for its answer, even if the result arrives first.
+    let stopping = null, interruptRequest = null;
+    const stop = (reason) => {
+      if (stopping || finished) return;
+      stopping = reason;
+      log(reason === "timeout" ? "turn time limit reached; interrupting the cloud session" : "stopping the cloud turn");
+      interruptRequest = io.turn.track(this.#interruptQuietly(session), "interrupt");
+      timers.push(setTimeout(() => finish({ status: "cancelled", unconfirmed: true }), this.stopWaitMs));
     };
+    const onAbort = () => stop("cancel");
     io.signal.addEventListener("abort", onAbort, { once: true });
     if (io.signal.aborted) onAbort();
-    // The turn's hard limit fires on its own timer: a stream busy with keepalives can't postpone it.
-    timers.push(setTimeout(() => finish({ status: "failed", error: `timed out after ${Math.round(this.turnTimeoutMs / 60_000)} min` }), this.turnTimeoutMs));
+    // The limit fires on its own timer: a stream busy with keepalives can't postpone it.
+    timers.push(setTimeout(() => stop("timeout"), this.turnTimeoutMs));
     // A container that fails to start shows up only in the session's status (external_metadata
     // .last_init_error, or status "failed"; research-claude.md §8), never as a stream event.
     const statusPoller = (async () => {
@@ -531,33 +605,19 @@ export class ClaudeBackend {
           if (s.status === "failed" || (initError && initError !== session.lastInitError)) {
             session.lastInitError = initError;
             log("the cloud session failed to start");
-            finish({ status: "failed", error: STARTUP_FAILED });
+            finish({ status: "failed", error: turnFailed(LABEL, { guidance: STARTUP_FAILED }) });
             return;
           }
         } catch (e) {
           if (finished) return;
-          if (e instanceof UserError) { finish({ status: "failed", error: e.message }); return; }
-          log(`status check failed: ${e.message}`);
+          if (e instanceof UserError) { finish({ status: "failed", error: e }); return; }
+          log(`status check failed: ${describeError(e)}`);
         }
       }
     })();
 
-    st.onPermission = async (row) => {
-      const req = row.payload.request ?? {};
-      const toolCallId = req.tool_use_id ?? `perm:${row.payload.request_id}`;
-      let allow = false;
-      try {
-        const r = await io.requestPermission({
-          sessionId: session.id,
-          toolCall: { toolCallId, title: `${req.tool_name ?? "Tool"}${req.input?.command ? `: ${req.input.command}` : ""}`, kind: toolKind(req.tool_name), status: "pending", rawInput: req.input ?? {} },
-          options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Deny", kind: "reject_once" }],
-        });
-        allow = r.outcome?.outcome === "selected" && r.outcome.optionId === "allow";
-      } catch (e) { log(`permission request failed: ${e.message}`); }
-      const response = allow ? { behavior: "allow", updatedInput: req.input ?? {} } : { behavior: "deny", message: "The user denied this in T3 Code." };
-      await api("POST", `/v1/code/sessions/${enc(session.cloudId)}/events`, { body: { events: [{ payload: { type: "control_response", response: { subtype: "success", request_id: row.payload.request_id, response } } }] } })
-        .catch((e) => log(`control_response failed: ${e.message}`));
-    };
+    // Permission prompts belong to the turn: tracked, and answered only while the turn is live.
+    st.onPermission = (row) => { io.turn.track(this.#answerPermission(session, row, io), "permission"); };
 
     let lastSeq = fromSeq;
     while (!finished) {
@@ -585,8 +645,8 @@ export class ClaudeBackend {
         }
       } catch (e) {
         if (finished || ac.signal.aborted) break;
-        if (e instanceof UserError) { finish({ status: "failed", error: e.message }); break; }
-        log(`stream error (${conn.signal.aborted ? "no data" : e.message}); reconnecting`);
+        if (e instanceof UserError) { finish({ status: "failed", error: e }); break; }
+        log(`stream error (${conn.signal.aborted ? "no data" : describeError(e)}); reconnecting`);
       } finally { clearTimeout(idle); }
       if (!finished) await sleep(1500, ac.signal);
     }
@@ -594,43 +654,80 @@ export class ClaudeBackend {
     for (const t of timers) clearTimeout(t);
     io.signal.removeEventListener("abort", onAbort);
     st.closeSetup();
+    // Stopped, no result came in time and the interrupt failed: the turn may still run, so the next
+    // prompt checks the session first (#ensureStopped).
+    if (interruptRequest) io.turn.track(interruptRequest.then((ok) => { session.stopUnconfirmed = !ok && !!finished?.unconfirmed; }), "interrupt");
     try {
       const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal: io.signal }));
       session.title = s.title ?? session.title;
     } catch {}
+    if (stopping === "timeout" && finished?.status !== "completed") {
+      log("turn timed out");
+      return { status: "failed", error: turnFailed(LABEL, { guidance: `It timed out after ${Math.round(this.turnTimeoutMs / 60_000)} min, so megha interrupted the session (${session.webUrl ?? this.webUrl(session.cloudId)}).` }) };
+    }
     const status = io.signal.aborted && finished?.status !== "completed" ? "cancelled" : finished?.status ?? "failed";
-    log(`turn ${status}`);
-    return { status, error: finished?.error };
+    log(`turn ${status}${finished?.unconfirmed ? " (stop not confirmed)" : ""}`);
+    return { status, error: finished?.error, code: finished?.code };
+  }
+
+  // Ask T3 about a can_use_tool request and send the answer, unless the turn stopped or finished in
+  // the meantime: then nothing is sent (the interrupt or the turn's end already settled the request),
+  // so an old prompt approved late can never allow a tool.
+  async #answerPermission(session, row, io) {
+    const req = row.payload.request ?? {};
+    const toolCallId = req.tool_use_id ?? `perm:${row.payload.request_id}`;
+    if (!io.turn.live) return;
+    const asked = io.requestPermission({
+      sessionId: session.id,
+      toolCall: { toolCallId, title: `${req.tool_name ?? "Tool"}${req.input?.command ? `: ${req.input.command}` : ""}`, kind: toolKind(req.tool_name), status: "pending", rawInput: req.input ?? {} },
+      options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Deny", kind: "reject_once" }],
+    }).catch((e) => { log(`permission request failed: ${describeError(e)}`); return null; });
+    const r = await Promise.race([asked, io.turn.ended.then(() => null)]);
+    if (!io.turn.live) { log("permission answered after the turn stopped; not sent"); return; }
+    const allow = r?.outcome?.outcome === "selected" && r.outcome.optionId === "allow";
+    const response = allow ? { behavior: "allow", updatedInput: req.input ?? {} } : { behavior: "deny", message: "The user denied this in T3 Code." };
+    await api("POST", `/v1/code/sessions/${enc(session.cloudId)}/events`, { body: { events: [{ payload: { type: "control_response", response: { subtype: "success", request_id: row.payload.request_id, response } } }] } });
   }
 
   // The session's pushed outcome branch, fetched as origin/<branch>, and its diff from the base.
   // A session megha created knows its base commit. An imported one (made on claude.ai, or its local
   // record is gone) doesn't: its base is where the outcome branch left the branch it started from.
+  // Every git call here takes the turn's signal (Stop kills it) and is bounded, so a stalled remote
+  // or credential helper can't hold a stopped turn open. Fetches only update refs/remotes/origin/*.
   async #branchDiff(session, signal) {
     if (session.bundle || !session.outcomeBranch) return { reason: session.bundle ? "bundle" : "none" };
     const cwd = session.cwd;
     const outcome = `refs/remotes/origin/${session.outcomeBranch}`;
-    const ls = await git(cwd, ["ls-remote", "origin", `refs/heads/${session.outcomeBranch}`]);
+    const net = { signal, network: true, timeoutMs: GIT_NETWORK_TIMEOUT_MS };
+    const ls = await git(cwd, ["ls-remote", "origin", `refs/heads/${session.outcomeBranch}`], net);
+    if (ls.timedOut) return { reason: "fetch" };
     if (ls.code !== 0 || !ls.stdout.trim()) return { reason: "not-pushed" };
-    throwIfCancelled(signal);
-    const f = await git(cwd, ["fetch", "--no-tags", "origin", `${session.outcomeBranch}:${outcome}`]);
-    if (f.code !== 0) return { reason: "fetch", detail: f.stderr.trim().slice(0, 200) };
+    const f = await git(cwd, ["fetch", "--no-tags", "origin", `${session.outcomeBranch}:${outcome}`], { ...net, timeoutMs: 5 * 60_000 });
+    if (f.code !== 0) return { reason: "fetch" };
     let base = session.baseSha;
-    if (base && (await git(cwd, ["cat-file", "-e", `${base}^{commit}`])).code !== 0) base = null;
+    if (base && (await git(cwd, ["cat-file", "-e", `${base}^{commit}`], { signal })).code !== 0) base = null;
     if (!base) {
       const from = session.baseBranch ?? session.repo?.defaultBranch;
       if (!from) return { reason: "no-base" };
-      throwIfCancelled(signal);
-      const fb = await git(cwd, ["fetch", "--no-tags", "origin", `+${from}:refs/remotes/origin/${from}`]);
-      const mb = fb.code === 0 ? await git(cwd, ["merge-base", `refs/remotes/origin/${from}`, outcome]) : null;
+      const fb = await git(cwd, ["fetch", "--no-tags", "origin", `+${from}:refs/remotes/origin/${from}`], { ...net, timeoutMs: 5 * 60_000 });
+      const mb = fb.code === 0 ? await git(cwd, ["merge-base", `refs/remotes/origin/${from}`, outcome], { signal }) : null;
       if (!mb || mb.code !== 0 || !/^[0-9a-f]{40}$/.test(mb.stdout.trim())) return { reason: "no-base", from };
       base = mb.stdout.trim();
       session.baseSha = base;
       session.baseBranch ??= from;
       log(`recovered the session's base from origin/${from}`);
     }
-    const d = await git(cwd, ["diff", "--no-color", base, outcome]);
+    const d = await git(cwd, ["diff", "--no-color", base, outcome], { signal });
     return { diff: d.code === 0 ? d.stdout : "" };
+  }
+  // git's own output is not shown: its "remote:" lines are the server's text.
+  #fetchFailedText(session) {
+    return `Could not fetch \`${session.outcomeBranch}\` from origin (git fetch failed or timed out). Check that \`git fetch origin\` works in this folder, then try /apply again.`;
+  }
+  #notPushedText(session, then = "") {
+    return session.outcomeBranch
+      ? `The session hasn't pushed \`${session.outcomeBranch}\` yet.${then}`
+      : "This session has no branch to apply: it wasn't set up to push one. Open it on claude.ai to see its changes.";
   }
   #noBaseText(session, r) {
     return `The session pushed \`${session.outcomeBranch}\`, but megha could not work out which commit it started from${r.from ? ` (\`${session.outcomeBranch}\` shares no history with origin/${r.from})` : ""}, so it can't build the diff. Compare the branch on GitHub instead.`;
@@ -644,7 +741,7 @@ export class ClaudeBackend {
   // Only GitHub-sourced sessions push an outcome branch; bundle-seeded ones have no way back.
   async #finishDiff(session, io) {
     const r = await this.#branchDiff(session, io.signal);
-    if (r.reason === "fetch") { io.text(`\n\nCould not fetch ${session.outcomeBranch}: ${r.detail}`); return; }
+    if (r.reason === "fetch") { io.text(`\n\n${this.#fetchFailedText(session)}`); return; }
     if (r.reason === "no-base") { io.text(`\n\n${this.#noBaseText(session, r)}`); return; }
     const diff = r.diff;
     if (!diff?.trim() || io.signal.aborted) return;
@@ -652,7 +749,7 @@ export class ClaudeBackend {
     const compare = this.#compare(session);
     if (session.config.apply === "on") {
       throwIfCancelled(io.signal);
-      const a = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${session.lastSeq}`, previousFile: session.appliedPatchFile });
+      const a = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${session.lastSeq}`, previousFile: session.appliedPatchFile, signal: io.signal });
       if (a.ok && !a.unchanged) session.appliedPatchFile = a.patchFile;
       io.text(`\n\n${a.message}`);
     } else {
@@ -681,9 +778,9 @@ export class ClaudeBackend {
         const r = await this.#branchDiff(session, io.signal);
         if (r.reason === "bundle") { io.text("This session was seeded from a git bundle, so it can't push a branch to apply. Open it on claude.ai to see its changes."); return; }
         if (r.reason === "no-base") { io.text(this.#noBaseText(session, r)); return; }
-        if (!r.diff?.trim()) { io.text(r.reason === "fetch" ? `Could not fetch ${session.outcomeBranch}: ${r.detail}` : `The session hasn't pushed \`${session.outcomeBranch ?? "a branch"}\` yet.`); return; }
+        if (!r.diff?.trim()) { io.text(r.reason === "fetch" ? this.#fetchFailedText(session) : this.#notPushedText(session)); return; }
         throwIfCancelled(io.signal);
-        const a = await applyLocally({ cwd: session.cwd, diff: r.diff, name: `${session.cloudId}-${session.lastSeq}`, previousFile: session.appliedPatchFile });
+        const a = await applyLocally({ cwd: session.cwd, diff: r.diff, name: `${session.cloudId}-${session.lastSeq}`, previousFile: session.appliedPatchFile, signal: io.signal });
         if (a.ok && !a.unchanged) session.appliedPatchFile = a.patchFile;
         saveSessionRecord(session);
         io.text(a.message);
@@ -692,8 +789,8 @@ export class ClaudeBackend {
       case "pr": {
         if (session.bundle) { io.text("This session was seeded from a git bundle, so it can't push a branch for a pull request."); return; }
         if (!session.repoChecked) await this.checkRepo(session, io.signal);
-        const ls = session.outcomeBranch ? await git(session.cwd, ["ls-remote", "origin", `refs/heads/${session.outcomeBranch}`]) : null;
-        if (!ls?.stdout.trim()) { io.text(`The session hasn't pushed \`${session.outcomeBranch ?? "a branch"}\` yet. Ask it to commit and push, then try /pr again.`); return; }
+        const ls = session.outcomeBranch ? await git(session.cwd, ["ls-remote", "origin", `refs/heads/${session.outcomeBranch}`], { signal: io.signal, network: true, timeoutMs: GIT_NETWORK_TIMEOUT_MS }) : null;
+        if (!ls?.stdout.trim()) { io.text(this.#notPushedText(session, " Ask it to commit and push, then try /pr again.")); return; }
         io.text(`[Open a pull request for \`${session.outcomeBranch}\`](${this.#compare(session)})`);
         return;
       }
@@ -705,7 +802,8 @@ export class ClaudeBackend {
   async list(cwd, cursor) {
     const repo = await repoInfo(cwd);
     const full = repo.github ? `${repo.github.owner}/${repo.github.name}`.toLowerCase() : null;
-    const mine = new Set(allSessionRecords("claude").filter((r) => samePath(r.cwd, cwd)).map((r) => r.cloudId));
+    // Bundle sessions megha created in this folder (createdIn, not the folder a record was last bound to).
+    const mine = new Set(allSessionRecords("claude").filter((r) => samePath(provenanceOf(r), cwd)).map((r) => r.cloudId));
     const j = await api("GET", "/v1/code/sessions", { query: { limit: 50, cursor } });
     // A session that names a repo must name this one; one that names none (bundle-seeded) must be
     // one megha made in this folder.
@@ -718,19 +816,7 @@ export class ClaudeBackend {
   }
 
   async replay(session, io) {
-    const s = await this.checkRepo(session);
-    session.title = s.title ?? session.title;
-    session.webUrl = this.webUrl(session.cloudId);
-    const outcome = (s.config?.outcomes ?? []).find((o) => o.type === "git_repository");
-    session.outcomeBranch ??= outcome?.git_info?.branches?.[0];
-    session.bundle ??= !(s.config?.sources ?? []).length;
-    // Where an imported GitHub session started: its source revision (a commit, or a branch), else the
-    // repo's default branch (web-created sources carry no revision). #branchDiff resolves the commit.
-    if (!session.bundle && !session.baseSha) {
-      const rev = (s.config?.sources ?? []).find((x) => x.type === "git_repository")?.revision;
-      if (typeof rev === "string" && /^[0-9a-f]{40}$/i.test(rev)) session.baseSha = rev.toLowerCase();
-      else session.baseBranch ??= (typeof rev === "string" && rev) || session.repo?.defaultBranch || null;
-    }
+    await this.checkRepo(session, io.signal); // also fills in the session's metadata (#hydrate)
     const rows = [];
     let cursor;
     for (let i = 0; i < 100; i++) {
@@ -823,7 +909,7 @@ class ClaudeTurn {
         if (p.subtype === "success" && !p.is_error) return { status: "completed" };
         if (p.subtype === "error_max_turns") return { status: "max_turns" };
         if (p.subtype === "error_during_execution" && p.terminal_reason === "interrupted") return { status: "cancelled" };
-        return { status: "failed", error: p.result || p.subtype || "error" };
+        return { status: "failed", code: resultCode(p) }; // p.result is the cloud's text: never kept
       }
       default: return null;
     }

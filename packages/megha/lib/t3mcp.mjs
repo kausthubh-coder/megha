@@ -4,7 +4,7 @@
 // (provider-acp adapter.ts acpMcpContext) and in the stdio server it passes in session/new.mcpServers.
 // The credential is only ever sent to that endpoint; it is never logged or written.
 
-import { sseFrames, log } from "./util.mjs";
+import { sseFrames, log, describeError } from "./util.mjs";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 
@@ -58,11 +58,9 @@ export async function callT3Tool(t3, tool, args, { fetchImpl = fetch, timeoutMs 
   const out = await send({ jsonrpc: "2.0", id: "megha-call", method: "tools/call", params: { name: tool, arguments: args } });
   const r = out.find((m) => m?.id === "megha-call");
   if (!r) throw new Error(`T3 Code MCP tool ${tool} returned nothing`);
-  if (r.error) throw new Error(`T3 Code MCP tool ${tool} failed: ${String(r.error.message ?? "error").slice(0, 200)}`);
-  if (r.result?.isError) {
-    const msg = (r.result.content ?? []).filter((c) => c.type === "text").map((c) => c.text).join(" ").slice(0, 200);
-    throw new Error(`T3 Code MCP tool ${tool} failed: ${msg || "error"}`);
-  }
+  // Like the clouds' errors, the server's own error text stays out of messages (describeError policy).
+  if (r.error) throw new Error(`T3 Code MCP tool ${tool} failed${Number.isInteger(r.error.code) ? ` (JSON-RPC ${r.error.code})` : ""}`);
+  if (r.result?.isError) throw new Error(`T3 Code MCP tool ${tool} reported an error`);
   return r.result;
 }
 
@@ -73,7 +71,7 @@ export async function linkPullRequest(t3, url, opts) {
     await callT3Tool(t3, "link_pull_request", { url }, opts);
     return "Linked the pull request to this thread in T3 Code.";
   } catch (e) {
-    log(`link_pull_request failed: ${e.message}`);
-    return `Could not link the pull request in T3 Code (${e.message}).`;
+    log(`link_pull_request failed: ${describeError(e)}`);
+    return `Could not link the pull request in T3 Code (${describeError(e)}).`;
   }
 }

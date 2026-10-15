@@ -5,6 +5,10 @@ import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { git } from "../lib/util.mjs";
+import { Turn } from "../lib/turn.mjs";
+import { MeghaAgent } from "../lib/agent.mjs";
+import { CodexBackend } from "../lib/codex.mjs";
+import { ClaudeBackend } from "../lib/claude.mjs";
 
 let failures = 0;
 export async function test(name, fn) {
@@ -33,6 +37,25 @@ export function hangingSse(signal) {
     },
   });
   return new Response(body, { headers: { "content-type": "text/event-stream" } });
+}
+
+// An SSE response the test writes to: push(frame) sends one frame ({data, event?, id?} or a plain
+// object sent as data). The body fails when the request is aborted, like a live stream.
+export function pushSse(signal) {
+  let ctrl;
+  const body = new ReadableStream({
+    start(c) {
+      ctrl = c;
+      const stop = () => { try { c.error(new DOMException("aborted", "AbortError")); } catch {} };
+      if (signal?.aborted) stop(); else signal?.addEventListener("abort", stop, { once: true });
+    },
+  });
+  const push = (f) => {
+    const fr = f && typeof f === "object" && "data" in f ? f : { data: f };
+    const text = `${fr.event ? `event: ${fr.event}\n` : ""}${fr.id ? `id: ${fr.id}\n` : ""}data: ${typeof fr.data === "string" ? fr.data : JSON.stringify(fr.data)}\n\n`;
+    try { ctrl.enqueue(new TextEncoder().encode(text)); } catch {}
+  };
+  return { response: new Response(body, { headers: { "content-type": "text/event-stream" } }), push };
 }
 
 // routes: [[method, RegExp on `host+path`, (req) => Response | Promise<Response>]]
@@ -92,17 +115,22 @@ export async function makeRepo({ origin = "https://github.com/acme/widget.git", 
   return dir;
 }
 
-// An io object like the agent passes to backends, recording everything.
+// An io object like the agent passes to backends (a real Turn included), recording everything. What
+// it records also goes to the secrecy capture, like a fake connection's traffic.
 export function recorder({ signal } = {}) {
   const updates = [];
+  const turn = new Turn({ signal });
+  const record = (u) => { updates.push(u); acpCaptured.push(u); };
   return {
     updates,
+    turn,
     text: () => updates.filter((u) => u.sessionUpdate === "agent_message_chunk").map((u) => u.content.text).join(""),
     io: {
-      signal: signal ?? new AbortController().signal,
-      update: (u) => updates.push(u),
-      text: (t) => updates.push({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: t } }),
-      requestPermission: async () => ({ outcome: { outcome: "selected", optionId: "allow" } }),
+      turn,
+      signal: turn.signal,
+      update: record,
+      text: (t) => record({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: t } }),
+      requestPermission: async (p) => { acpCaptured.push(p); return { outcome: { outcome: "selected", optionId: "allow" } }; },
     },
   };
 }
@@ -130,13 +158,40 @@ export function fakeConn() {
   return {
     notes,
     sessionUpdate: async (n) => { notes.push(n); acpCaptured.push(n); },
-    requestPermission: async () => ({ outcome: { outcome: "selected", optionId: "allow" } }),
+    requestPermission: async (p) => { acpCaptured.push(p); return { outcome: { outcome: "selected", optionId: "allow" } }; },
   };
 }
 // Record an ACP error (or anything else the client would see) for the secrecy suite.
 export function captureAcp(value) {
   acpCaptured.push(value instanceof Error ? { message: value.message, code: value.code, data: value.data } : value);
   return value;
+}
+
+// The one capture point for every test path. Wraps each public method of the agent and both backends
+// so that every error they throw or reject with (whether a test asserts on it, swallows it or ignores
+// it) and every ACP response the agent returns reaches acpCaptured. offline.mjs calls this once,
+// before any suite runs.
+export function instrument() {
+  const wrap = (cls, { results }) => {
+    const proto = cls.prototype;
+    for (const name of Object.getOwnPropertyNames(proto)) {
+      const d = Object.getOwnPropertyDescriptor(proto, name);
+      if (name === "constructor" || typeof d.value !== "function" || d.value.__captured) continue;
+      const orig = d.value;
+      const wrapped = function (...args) {
+        let r;
+        try { r = orig.apply(this, args); } catch (e) { captureAcp(e); throw e; }
+        if (r && typeof r.then === "function") return r.then((v) => { if (results && v !== undefined) acpCaptured.push(v); return v; }, (e) => { captureAcp(e); throw e; });
+        if (results && r !== undefined) acpCaptured.push(r);
+        return r;
+      };
+      wrapped.__captured = true;
+      Object.defineProperty(proto, name, { ...d, value: wrapped });
+    }
+  };
+  wrap(MeghaAgent, { results: true });
+  wrap(CodexBackend, { results: false });
+  wrap(ClaudeBackend, { results: false });
 }
 
 // stdout and stderr of the whole offline run, teed (still printed) so the secrecy suite can scan them.

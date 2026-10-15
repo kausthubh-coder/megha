@@ -3,20 +3,23 @@
 
 import crypto from "node:crypto";
 import * as acp from "@agentclientprotocol/sdk";
-import { log, sleep, UserError, CloudError, loadSessionRecord, findSessionByCloudId, saveSessionRecord, hintKey, saveHint, loadHint } from "./util.mjs";
+import { log, sleep, UserError, CloudError, describeError, provenanceOf, loadSessionRecord, findSessionByCloudId, saveSessionRecord, hintKey, saveHint, loadHint } from "./util.mjs";
+import { Turn } from "./turn.mjs";
 import { cleanPrompt, t3AttachmentDirs } from "./prompt.mjs";
 import { t3McpFrom } from "./t3mcp.mjs";
 
 // T3 sends session/cancel and waits only 10 s for session/prompt to return before it marks the turn
 // failed (provider-acp adapter.ts interrupt path). Return `cancelled` well inside that; the cloud
-// cancel and the end of the cloud turn finish in the background.
+// cancel and the end of the cloud turn finish in the background, owned by the turn (lib/turn.mjs).
 export const CANCEL_GRACE_MS = 1500;
-// A prompt that follows a cancel waits this long for the cancelled cloud turn to settle first; if it
-// still hasn't, the prompt is refused rather than raced against the old turn's session state.
+// A prompt waits this long for the session's previous turn to settle (its cloud cancel answered, its
+// stream and poller wound down, its git calls ended); if it still hasn't, the prompt is refused rather
+// than raced against the old turn's session state. Longer than a backend's stop wait (30 s) and the
+// request bound (30 s), so a turn that settles on its own is always waited for.
 export const DRAIN_WAIT_MS = 60_000;
 
 // Fields of a session record that tie it to a cloud task (copied when a new session takes over a task).
-const CLOUD_FIELDS = ["cloudId", "turnId", "doneTurnId", "lastSeq", "title", "webUrl", "bundle", "outcomeBranch", "baseBranch", "baseSha", "appliedPatchFile", "sentMode", "sentModel", "prUrl"];
+const CLOUD_FIELDS = ["cloudId", "createdIn", "turnId", "doneTurnId", "lastSeq", "title", "webUrl", "bundle", "outcomeBranch", "baseBranch", "baseSha", "appliedPatchFile", "sentMode", "sentModel", "prUrl"];
 
 export class MeghaAgent {
   constructor(conn, backend, { version = "0.0.0", env = process.env, drainWaitMs = DRAIN_WAIT_MS } = {}) {
@@ -28,10 +31,11 @@ export class MeghaAgent {
     this.sessions = new Map(); // sessionId -> session
   }
 
-  // UserError and CloudError messages are built by megha from fixed text (never a response body).
+  // The ACP error T3 shows. Its text follows describeError, the same policy as every log line: megha's
+  // fixed messages pass, anything else is named by kind (never by a server's text).
   rpcError(e) {
     if (e instanceof acp.RequestError) return e;
-    const msg = e instanceof UserError || e instanceof CloudError ? e.message : `${this.backend.label}: ${e.message}`;
+    const msg = e instanceof UserError || e instanceof CloudError ? e.message : `${this.backend.label}: ${describeError(e)}`;
     return new acp.RequestError(-32603, msg);
   }
 
@@ -74,8 +78,13 @@ export class MeghaAgent {
     let s = this.sessions.get(sessionId);
     if (s) return s;
     const rec = loadSessionRecord(sessionId) ?? findSessionByCloudId(this.backend.name, sessionId);
-    s = rec ? { ...rec, id: sessionId, cwd: cwd || rec.cwd, config: { ...(rec.config ?? {}) } }
-      : { id: sessionId, backend: this.backend.name, cwd, cloudId: sessionId, config: {}, createdAt: new Date().toISOString() };
+    // createdIn (where megha created the cloud task) comes only from the record, never from this
+    // bind's cwd: rebinding a session must not become evidence that it belongs here.
+    s = rec ? { ...rec, id: sessionId, cwd: cwd || rec.cwd, createdIn: provenanceOf(rec), config: { ...(rec.config ?? {}) } }
+      : { id: sessionId, backend: this.backend.name, cwd, cloudId: sessionId, createdIn: null, config: {}, createdAt: new Date().toISOString() };
+    // What the local record alone can refuse (a bundle session made in another folder) is refused
+    // here, before a failing network check could let the session bind unchecked.
+    this.backend.checkRecord?.(s);
     this.#attachT3(s, mcpServers);
     await this.backend.prepare(s);
     // A cloud id can name any task or session of the account: confirm it belongs to this repo. A wrong
@@ -84,7 +93,7 @@ export class MeghaAgent {
     if (s.cloudId) {
       try { await this.backend.checkRepo(s); } catch (e) {
         if (e instanceof UserError) throw e;
-        log(`repo check deferred: ${e.message}`);
+        log(`repo check deferred: ${describeError(e)}`);
       }
     }
     this.sessions.set(sessionId, s);
@@ -140,45 +149,45 @@ export class MeghaAgent {
     const input = cleanPrompt(params.prompt, { attachmentDirs: t3AttachmentDirs(this.env) });
     if (!input.text.trim() && !input.images.length) throw acp.RequestError.invalidParams(undefined, "Empty prompt");
 
-    const ac = new AbortController();
-    const turn = { muted: false };
-    s.active = ac;
-    // A steer is session/cancel followed by a new prompt: let the cancelled cloud turn settle so the
-    // follow-up lands on a finished turn instead of racing it. If it won't settle in time, refuse: the
-    // old turn still owns the session's cloud state.
-    if (s.draining) {
-      const drained = await Promise.race([s.draining.then(() => true), sleep(this.drainWaitMs, ac.signal).then(() => false)]);
+    const turn = new Turn();
+    s.active = turn;
+    // The previous turn may still own the session's cloud state: a steer (session/cancel, then a new
+    // prompt) arrives while the cancelled turn winds down, and even a turn that already answered T3 can
+    // have its cloud cancel in flight. Wait for it to settle; if it won't in time, refuse.
+    const prev = s.turn;
+    if (prev && !prev.isSettled) {
+      const drained = await Promise.race([prev.settled.then(() => true), sleep(this.drainWaitMs, turn.signal).then(() => false)]);
       if (!drained) {
         s.active = null;
-        if (ac.signal.aborted) return { stopReason: "cancelled" };
+        if (turn.stopped) return { stopReason: "cancelled" };
         log("previous turn still settling; refusing the new prompt");
         throw new acp.RequestError(-32603, "The previous cloud turn is still stopping. Try again in a moment.");
       }
     }
+    s.turn = turn;
     const send = (u) => { if (!turn.muted) this.#send(s.id, u); };
     const io = {
-      signal: ac.signal,
+      turn,
+      signal: turn.signal,
       update: send,
       text: (t) => send({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: t } }),
-      requestPermission: (p) => (turn.muted ? Promise.resolve({ outcome: { outcome: "cancelled" } }) : this.conn.requestPermission(p)),
+      requestPermission: (p) => (turn.muted || !turn.live ? Promise.resolve({ outcome: { outcome: "cancelled" } }) : this.conn.requestPermission(p)),
     };
     const t0 = Date.now();
-    const run = (async () => {
-      if (ac.signal.aborted) return "cancelled";
+    const run = turn.run(async () => {
+      if (turn.stopped) return "cancelled";
       if (input.command) { await this.backend.command(s, input.command, io); return "end_turn"; }
       if (!s.cloudId) this.#adoptFromHint(s, input, io);
       return this.backend.prompt(s, input, io);
-    })();
-    const settled = run.then((r) => ({ r }), (e) => ({ e }));
-    const aborted = new Promise((resolve) => ac.signal.addEventListener("abort", resolve, { once: true }));
-    const first = await Promise.race([settled, aborted.then(() => sleep(CANCEL_GRACE_MS)).then(() => null)]);
+    });
+    const outcome = run.then((r) => ({ r }), (e) => ({ e }));
+    const aborted = new Promise((resolve) => (turn.stopped ? resolve() : turn.signal.addEventListener("abort", resolve, { once: true })));
+    const first = await Promise.race([outcome, aborted.then(() => sleep(CANCEL_GRACE_MS)).then(() => null)]);
 
     if (first === null) {
       // Cancelled and the backend is still winding the cloud turn down: answer T3 now, finish quietly.
       turn.muted = true;
-      const draining = settled.then((x) => { if (x.e) log(`cancelled turn ended with: ${x.e.message}`); this.#rememberThread(s); });
-      s.draining = draining;
-      draining.finally(() => { if (s.draining === draining) s.draining = null; });
+      turn.track(outcome.then((x) => { if (x.e) log(`cancelled turn ended with: ${describeError(x.e)}`); this.#rememberThread(s); }), "cancelled turn");
       s.active = null;
       log(`prompt cancelled; answered in ${((Date.now() - t0) / 1000).toFixed(1)} s, cloud turn settles in the background`);
       return { stopReason: "cancelled" };
@@ -186,18 +195,18 @@ export class MeghaAgent {
     s.active = null;
     this.#rememberThread(s);
     if (first.e) {
-      if (ac.signal.aborted) return { stopReason: "cancelled" };
-      log(`prompt failed: ${first.e.message}`);
+      if (turn.stopped) return { stopReason: "cancelled" };
+      log(`prompt failed: ${describeError(first.e)}`);
       throw this.rpcError(first.e);
     }
-    const stopReason = ac.signal.aborted ? "cancelled" : first.r;
+    const stopReason = turn.stopped ? "cancelled" : first.r;
     log(`prompt done: ${stopReason} in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
     return { stopReason };
   }
 
   async cancel(params) {
     const s = this.sessions.get(params.sessionId);
-    s?.active?.abort();
+    s?.active?.stop();
   }
 
   // Rollback (and other session replacements) give megha a brand-new session for an existing thread,
@@ -219,7 +228,7 @@ export class MeghaAgent {
 
   #rememberThread(s) {
     if (!s.t3Key || !s.cloudId) return;
-    try { saveSessionRecord(s); saveHint(s.t3Key, { backend: this.backend.name, sessionId: s.id, cloudId: s.cloudId }); } catch (e) { log(`hint save failed: ${e.message}`); }
+    try { saveSessionRecord(s); saveHint(s.t3Key, { backend: this.backend.name, sessionId: s.id, cloudId: s.cloudId }); } catch (e) { log(`hint save failed: ${describeError(e)}`); }
   }
 
   // After the response to session/new|load|resume is on the wire (T3 waits briefly for this).
@@ -228,6 +237,6 @@ export class MeghaAgent {
   }
 
   #send(sessionId, update) {
-    this.conn.sessionUpdate({ sessionId, update }).catch((e) => log(`sessionUpdate failed: ${e.message}`));
+    this.conn.sessionUpdate({ sessionId, update }).catch((e) => log(`sessionUpdate failed: ${describeError(e)}`));
   }
 }

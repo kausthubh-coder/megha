@@ -82,6 +82,49 @@ export async function run({ logins }) {
     await swallow(a.prompt({ sessionId: s2.sessionId, prompt: text("new") }));
   });
 
+  await test("secrecy: failed cloud turns (SSE error events, failed turn/completed, polled failures, Claude results) with canary diagnostics", async () => {
+    const diag = `${CANARY.serverBody} env_vars={"API_KEY":"${CANARY.envSecret}"}`;
+    // Codex: a turn that fails on the stream, then one that fails as seen by the poller.
+    const repo = await makeRepo({ origin: "https://github.com/acme/sec.git" });
+    let gets = 0, posts = 0;
+    const failedTurn = (id) => ({ task: { id: "task_e_fail", title: "t", current_turn_id: id },
+      current_assistant_turn: { id, turn_status: "failed", environment_id: "env_sec", environment: secretEnv, error: { code: CANARY.serverBody, message: diag },
+        output_items: [{ type: "message", content: [{ content_type: "text", text: "partial" }] }] } });
+    mockFetch([
+      ["GET", new RegExp(`^${CX}/wham/models$`), () => json({ models: [{ slug: "gpt-5.6-sol", display_name: "Sol", visibility: "list" }] })],
+      ["GET", new RegExp(`^${CX}/wham/environments/by-repo/github/`), () => json([secretEnv])],
+      ["POST", new RegExp(`^${CX}/wham/tasks$`), () => json({ turn: { id: `task_e_fail~assttrn_e_${++posts + 1}` } })],
+      ["GET", new RegExp(`^${CX}/wham/tasks/task_e_fail/turns/task_e_fail~assttrn_e_2/stream$`), () => sse([thread("turn/started"),
+        thread("error", { error: { message: diag, codexErrorInfo: { httpConnectionFailed: { body: diag } } }, willRetry: false }),
+        thread("turn/completed", { turn: { status: "failed", error: { message: diag, additionalDetails: diag } } })])],
+      ["GET", new RegExp(`^${CX}/wham/tasks/task_e_fail/turns/[^/]+/stream$`), (req) => new Response(new ReadableStream({ start(c) { req.signal?.addEventListener("abort", () => { try { c.error(new DOMException("aborted", "AbortError")); } catch {} }); } }))],
+      ["GET", new RegExp(`^${CX}/wham/tasks/task_e_fail$`), () => json(++gets === 1 ? failedTurn("task_e_fail~assttrn_e_1") : failedTurn(`task_e_fail~assttrn_e_${posts + 1}`))],
+    ]);
+    const a = new MeghaAgent(fakeConn(), new CodexBackend({ pollMs: 50 }), { env: {} });
+    const { sessionId } = await a.newSession({ cwd: repo, mcpServers: [] });
+    a.sessions.get(sessionId).cloudId = "task_e_fail";
+    await swallow(a.prompt({ sessionId, prompt: text("fails on the stream") }));
+    await swallow(a.prompt({ sessionId, prompt: text("fails on the poll") }));
+    await swallow(a.loadSession({ sessionId: "task_e_fail", cwd: repo, mcpServers: [] }));
+
+    // Claude: failed results with the cloud's text in result.result, error subtypes megha doesn't know.
+    const crepo = await makeRepo({ origin: null });
+    let seq = 10;
+    const results = [{ subtype: "error_during_execution", is_error: true, result: diag }, { subtype: `error_${CANARY.serverBody}`, is_error: true, result: diag }, { subtype: "success", is_error: true, result: diag }];
+    mockFetch([
+      ["GET", new RegExp(`^${AN}/v1/environment_providers$`), () => json({ environments: [{ environment_id: "env_cloud", name: "Default", kind: "anthropic_cloud" }] })],
+      ["GET", new RegExp(`^${AN}/v1/models$`), () => json({ data: [{ id: "claude-opus-5-5", display_name: "Claude Opus 5.5" }] })],
+      ["POST", new RegExp(`^${AN}/v1/code/sessions/cse_fail/events$`), () => json({ results: [{ sequence_num: String(seq += 10) }] })],
+      ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_fail/events/stream$`), () => sse([{ event: "client_event", id: String(seq + 1), data: { sequence_num: String(seq + 1), source: "worker", payload: { type: "result", ...results.shift() } } }])],
+      ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_fail$`), () => json({ session: { id: "cse_fail", title: "t", external_metadata: { last_init_error: diag } } })],
+    ]);
+    const c = new MeghaAgent(fakeConn(), new ClaudeBackend({ statusPollMs: 60_000 }), { env: {} });
+    const cs = await c.newSession({ cwd: crepo, mcpServers: [] });
+    const sess = c.sessions.get(cs.sessionId);
+    Object.assign(sess, { cloudId: "cse_fail", bundle: true, repoChecked: true, sentMode: sess.config.mode, sentModel: sess.config.model });
+    for (let i = 0; i < 3; i++) await swallow(c.prompt({ sessionId: cs.sessionId, prompt: text(`fails ${i}`) }));
+  });
+
   await test("secrecy: no canary in stdout, stderr, ACP traffic or persisted files of the whole run", () => {
     const canaries = [...Object.values(CANARY), logins.codexToken, logins.claudeToken];
     const sources = [
