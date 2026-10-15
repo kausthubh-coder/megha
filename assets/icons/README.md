@@ -22,6 +22,14 @@ sharp is resolved from `apps/site` (a dev dependency there), so run `bun install
 The mark is a cloud whose base runs out into a speech-bubble tail: a thread that runs in the cloud. Colors:
 ink `#18202e`, pale `#eef2f8`, megha blue `#2f6fd6`.
 
+## ACP Registry icons
+
+`registry/` holds the 16x16 monochrome glyphs the ACP Registry requires (`fill="currentColor"` only):
+`megha-codex.svg` (the cloud with a hex nut cut out) and `megha-claude.svg` (the cloud with a
+four-point spark cut out). Neither uses the OpenAI or Anthropic logo. `node assets/icons/registry/build.mjs`
+writes them, copies them to `assets/registry/<id>/icon.svg`, and renders `registry/contact-sheet.png`
+(16, 32 and 64 px on light and dark, plus the 16 px pixels zoomed) to check them by eye.
+
 ## Trademarks
 
 The OpenAI logo is a trademark of OpenAI. The Claude logo is a trademark of Anthropic. Megha uses them only

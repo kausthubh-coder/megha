@@ -8,17 +8,20 @@ import { DATA_DIR } from "./util.mjs";
 
 const hours = (ms) => (ms > 48 * 3600_000 ? `${Math.round(ms / 86_400_000)} days` : `${Math.max(0, Math.round(ms / 3600_000))} h`);
 
-export function loginChecks() {
-  const out = [];
+// One backend's CLI login, read only (also `megha --login` and ACP authenticate, lib/login.mjs).
+export function loginCheck(backend) {
   try {
-    const a = readAuth();
-    out.push({ ok: true, name: "codex login", detail: `ChatGPT sign-in found${a.expiresAt ? `, token valid for ${hours(a.expiresAt - Date.now())}` : ""}` });
-  } catch (e) { out.push({ ok: false, name: "codex login", detail: e.message }); }
-  try {
+    if (backend === "codex") {
+      const a = readAuth();
+      return { ok: true, name: "codex login", detail: `ChatGPT sign-in found${a.expiresAt ? `, token valid for ${hours(a.expiresAt - Date.now())}` : ""}` };
+    }
     const c = readCredentials();
-    out.push({ ok: true, name: "claude login", detail: `claude.ai login found${c.expiresAt ? `, token valid for ${hours(c.expiresAt - Date.now())}` : ""}` });
-  } catch (e) { out.push({ ok: false, name: "claude login", detail: e.message }); }
-  return out;
+    return { ok: true, name: "claude login", detail: `claude.ai login found${c.expiresAt ? `, token valid for ${hours(c.expiresAt - Date.now())}` : ""}` };
+  } catch (e) { return { ok: false, name: `${backend} login`, detail: e.message }; }
+}
+
+export function loginChecks() {
+  return [loginCheck("codex"), loginCheck("claude")];
 }
 
 export function toolChecks() {

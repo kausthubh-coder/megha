@@ -9,9 +9,11 @@ import { VERSION } from "./lib/version.mjs";
 const HELP = `megha ${VERSION}: run T3 Code (or any ACP client) threads on Codex Cloud or Claude Code on the web.
 
 Usage:
-  megha --backend codex     ACP agent for Codex Cloud (uses your \`codex login\`)
-  megha --backend claude    ACP agent for Claude Code on the web (uses your \`claude auth login\`)
-  megha doctor              check Node, git and both logins (prints no tokens)
+  megha --backend codex           ACP agent for Codex Cloud (uses your \`codex login\`)
+  megha --backend claude          ACP agent for Claude Code on the web (uses your \`claude\` /login)
+  megha --backend <b> --login     say whether that CLI login is there and how to sign in
+                                  (the ACP sign-in method; never runs a login or touches tokens)
+  megha doctor                    check Node, git and both logins (prints no tokens)
   megha --version | --help
 
 In T3 Code: Settings > Providers > Add provider > Local ACP command, with the command
@@ -31,6 +33,12 @@ const backendName = i >= 0 ? argv[i + 1] : process.env.MEGHA_BACKEND ?? process.
 if (!["codex", "claude"].includes(backendName ?? "")) {
   process.stderr.write(`megha: pass --backend codex or --backend claude\n\n${HELP}`);
   process.exit(2);
+}
+
+// The ACP terminal sign-in method (lib/login.mjs): a plain terminal program, not the ACP agent.
+if (argv.includes("--login")) {
+  const { runLogin } = await import("./lib/login.mjs");
+  process.exit(await runLogin({ backend: backendName }));
 }
 
 const acp = await import("@agentclientprotocol/sdk");

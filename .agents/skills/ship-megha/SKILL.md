@@ -30,8 +30,8 @@ megha ships from `main` on `kausthubh-coder/megha` (public) to these surfaces:
 5. **Release only:** bump the version in this PR. Edit `"version"` in `packages/megha/package.json` with your edit tool (`npm version` here runs a full npm install of the workspace and writes a `package-lock.json`), then:
    ```
    bun install                       # updates the workspace version recorded in bun.lock
-   npm view t3-megha version            # must be lower than the new version (404 before the first publish)
-   cd packages/megha && npm publish --dry-run   # name megha, the new version, 14 files: LICENSE, README.md, index.mjs, lib/*.mjs, package.json
+   npm view t3-megha version         # must be lower than the new version (404 before the first publish)
+   cd packages/megha && npm publish --dry-run   # name t3-megha, the new version, 16 files: LICENSE, README.md, index.mjs, lib/*.mjs (12), package.json
    ```
    Commit `packages/megha/package.json` and `bun.lock` together, and nothing else from the bump (no `package-lock.json`).
 
