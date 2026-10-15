@@ -15,6 +15,8 @@
 //                         prompt that is exactly "/status" or "/open" (they only read the task).
 //   --shared-data         use the real data dir (%LOCALAPPDATA%\megha) instead of a throwaway one
 //   --agent <index.mjs>   agent entry to run (default: this checkout's packages/megha/index.mjs)
+//   -- <agent args>       passed to the agent after --backend <b>, like T3's commandArgs
+//                         (e.g. `-- --default-mode bypassPermissions --default-apply on`)
 //
 // Default steps (read-only, no cloud task): initialize -> session/new -> session/list.
 // A steps file is a JSON array of {method, params?, notify?, async?, waitMs?, timeoutMs?, expectError?}.
@@ -54,7 +56,12 @@ function parseArgs(argv) {
   return a;
 }
 
-const args = parseArgs(process.argv.slice(2));
+// Everything after a bare `--` goes to the agent after `--backend <b>` (T3's commandArgs), e.g.
+// `-- --default-mode bypassPermissions`.
+const rawArgs = process.argv.slice(2);
+const sep = rawArgs.indexOf("--");
+const agentArgs = sep >= 0 ? rawArgs.slice(sep + 1) : [];
+const args = parseArgs(sep >= 0 ? rawArgs.slice(0, sep) : rawArgs);
 const backend = args.backend;
 if (!["codex", "claude"].includes(backend)) {
   console.error("usage: acp-drive.mjs --backend codex|claude [--cwd <repo>] [--load <id>] [--steps <file>] [--prompt <text> --allow-cloud-task]");
@@ -108,7 +115,7 @@ if (!args.flags.has("shared-data")) env.MEGHA_DATA_DIR = join(out, "data");
 // No T3 MCP endpoint: this drive is not a T3 thread.
 delete env.T3_ACP_MCP_ENDPOINT; delete env.T3_ACP_MCP_AUTHORIZATION;
 
-const child = spawn(process.execPath, [agentPath, "--backend", backend], { cwd, env, stdio: ["pipe", "pipe", "pipe"], shell: false, windowsHide: true });
+const child = spawn(process.execPath, [agentPath, "--backend", backend, ...agentArgs], { cwd, env, stdio: ["pipe", "pipe", "pipe"], shell: false, windowsHide: true });
 let stderr = "";
 child.stderr.on("data", (d) => { stderr += d.toString(); });
 const pending = new Map();

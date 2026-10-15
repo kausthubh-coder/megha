@@ -66,6 +66,40 @@ T3 on Windows refuses `.cmd` shims, so `commandPath` must be `node.exe` and the 
 }
 ```
 
+### Defaults for new threads
+
+Each provider instance can set the values its new threads start with. Add these after `--backend` in
+`commandArgs`:
+
+| Flag | Values | Without it |
+|---|---|---|
+| `--default-mode` | Claude: `default`, `acceptEdits`, `plan`, `bypassPermissions`. Codex: `code`, `ask`, `plan` | `acceptEdits` (Claude), `code` (Codex) |
+| `--default-model` | a model id from the Model option, such as `claude-opus-5-5` or `gpt-5.6-sol` | megha's default model |
+| `--default-environment` | an environment id, or its name as the Environment option shows it | megha's usual pick |
+| `--default-apply` | `on` or `off` | `off` |
+
+Names match without case, so `--default-environment heavy` finds an environment called "Heavy". Each
+flag also takes the `--flag=value` form. A default only sets the starting value: every thread can
+still change each option in T3. Sessions megha already has a record of keep their saved values.
+
+If a value doesn't exist (a model the account doesn't have, an environment that was deleted, a Codex
+mode on Claude), megha uses the usual default and logs one line to stderr. The session still starts.
+
+```json
+"megha-claude": {
+  "driver": "acpRegistry",
+  "displayName": "Claude Code on the web",
+  "config": {
+    "source": "local",
+    "commandPath": "C:\\path\\to\\node.exe",
+    "commandArgs": ["C:\\path\\to\\megha\\index.mjs", "--backend", "claude",
+      "--default-mode", "bypassPermissions", "--default-model", "claude-opus-5-5"]
+  }
+}
+```
+
+For Codex the same idea looks like `"--backend", "codex", "--default-mode", "ask", "--default-apply", "on"`.
+
 ## How a thread maps to the cloud
 
 - `session/new` reads the cwd's git remote and branch, the model list and the environment list. It

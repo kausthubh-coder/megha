@@ -16,8 +16,19 @@ Usage:
   megha doctor                    check Node, git and both logins (prints no tokens)
   megha --version | --help
 
+Starting values for new threads (add after --backend; each thread can still change them):
+  --default-mode <mode>           claude: default, acceptEdits, plan, bypassPermissions (megha's default: acceptEdits)
+                                  codex: code, ask, plan (megha's default: code)
+  --default-model <id>            a model id from the Model option, e.g. claude-opus-5-5 or gpt-5.6-sol
+  --default-environment <id|name> a cloud environment, by id or by its name
+  --default-apply on|off          apply the cloud diff to this checkout (megha's default: off)
+A value the account doesn't have (a model, an environment) is ignored with one line on stderr.
+
 In T3 Code: Settings > Providers > Add provider > Local ACP command, with the command
-\`node <path>/megha/index.mjs --backend codex\` (one provider per backend).
+\`node <path>/megha/index.mjs --backend codex\` (one provider per backend), or edit
+~/.t3/userdata/settings.json, for example:
+  "commandArgs": ["<path>/megha/index.mjs", "--backend", "claude",
+                  "--default-mode", "bypassPermissions", "--default-model", "claude-opus-5-5"]
 `;
 
 const argv = process.argv.slice(2);
@@ -44,11 +55,13 @@ if (argv.includes("--login")) {
 const acp = await import("@agentclientprotocol/sdk");
 const { log, setLogPrefix, migrateLegacyStore, describeError } = await import("./lib/util.mjs");
 const { MeghaAgent } = await import("./lib/agent.mjs");
-const backend = backendName === "codex" ? new (await import("./lib/codex.mjs")).CodexBackend() : new (await import("./lib/claude.mjs")).ClaudeBackend();
+const { parseDefaults, describeDefaults } = await import("./lib/defaults.mjs");
 
 setLogPrefix(`megha:${backendName}`);
+const defaults = parseDefaults(argv);
+const backend = backendName === "codex" ? new (await import("./lib/codex.mjs")).CodexBackend({ defaults }) : new (await import("./lib/claude.mjs")).ClaudeBackend({ defaults });
 try { migrateLegacyStore(); } catch (e) { log(`session migration failed: ${describeError(e)}`); }
 const stream = acp.ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin));
 const conn = new acp.AgentSideConnection((c) => new MeghaAgent(c, backend, { version: VERSION }), stream);
 conn.closed?.then?.(() => process.exit(0));
-log(`ready (v${VERSION}, cwd ${process.cwd()})`);
+log(`ready (v${VERSION}, cwd ${process.cwd()}, defaults: ${describeDefaults(defaults)})`);

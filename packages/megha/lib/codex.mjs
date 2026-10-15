@@ -11,6 +11,7 @@ import {
   cloudStateOf, setCloudState, startCloudTurn, stillRunningText, classifyCloud, applyReading, hasEnded, failedText,
 } from "./util.mjs";
 import { codexChangesToPatch, diffToolCall, applyLocally, reportApply, diffFiles } from "./diff.mjs";
+import { defaultFor, APPLY_CHOICES } from "./defaults.mjs";
 import { imageSize, imageExtension } from "./image.mjs";
 import { linkPullRequest } from "./t3mcp.mjs";
 import { VERSION } from "./version.mjs";
@@ -210,8 +211,9 @@ export class CodexBackend {
   // which megha cancels it in the cloud; stopWaitMs: how long a stopped turn (Stop or the limit) is
   // watched for its terminal status. Tests shorten them. applyGit: the git runner for the local apply
   // (lib/diff.mjs `run`); tests replace it to replay a git apply killed by its timeout.
-  constructor({ pollMs = POLL_MS, turnTimeoutMs = 3 * 3600_000, stopWaitMs = 30_000, applyGit = git } = {}) {
-    Object.assign(this, { pollMs, turnTimeoutMs, stopWaitMs, applyGit });
+  // defaults: the --default-* starting values (lib/defaults.mjs), used where a session has no value yet.
+  constructor({ pollMs = POLL_MS, turnTimeoutMs = 3 * 3600_000, stopWaitMs = 30_000, applyGit = git, defaults = {} } = {}) {
+    Object.assign(this, { pollMs, turnTimeoutMs, stopWaitMs, applyGit, defaults });
   }
 
   checkAuth() { readAuth(); }
@@ -338,12 +340,16 @@ export class CodexBackend {
     session.models = models.v;
     const cfg = session.config ?? (session.config = {});
     const createValue = session.creatable ? `create:${session.creatable.fullName}` : null;
+    const preferred = (key, choices) => defaultFor(this.defaults, key, choices, { backend: this.label });
     if (!cfg.environment || !(envs.some((e) => e.id === cfg.environment) || cfg.environment === createValue)) {
-      cfg.environment = pickDefaultEnv(envs, repo.github?.name)?.id ?? createValue ?? "none";
+      // Only this repo's environments can match: a default naming another repo's falls back.
+      cfg.environment = preferred("environment", envs.map((e) => ({ value: e.id, names: [e.label] })))
+        ?? pickDefaultEnv(envs, repo.github?.name)?.id ?? createValue ?? "none";
     }
-    cfg.model ??= session.models.some((m) => m.id === DEFAULT_MODEL) ? DEFAULT_MODEL : session.models[0]?.id ?? DEFAULT_MODEL;
-    cfg.mode ??= "code";
-    cfg.apply ??= "off";
+    cfg.model ??= preferred("model", session.models.map((m) => ({ value: m.id, names: [m.name] })))
+      ?? (session.models.some((m) => m.id === DEFAULT_MODEL) ? DEFAULT_MODEL : session.models[0]?.id ?? DEFAULT_MODEL);
+    cfg.mode ??= preferred("mode", MODES.map((m) => ({ value: m }))) ?? "code";
+    cfg.apply ??= preferred("apply", APPLY_CHOICES) ?? "off";
     const local = await localP;
     if (!cfg.localChanges) cfg.localChanges = local.v?.any ? "on" : "off";
   }

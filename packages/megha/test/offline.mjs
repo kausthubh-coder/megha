@@ -26,7 +26,7 @@ instrument();
 const logins = writeFakeLogins(join(root, "logins"));
 const realFetch = globalThis.fetch;
 // `node test/offline.mjs suite-round2.mjs` runs only the named suites (while working on one).
-const ALL = ["suite-core.mjs", "suite-prompt.mjs", "suite-agent.mjs", "suite-codex.mjs", "suite-claude.mjs", "suite-hardening.mjs", "suite-round2.mjs", "suite-round3.mjs", "suite-round4.mjs", "suite-round5.mjs", "suite-stream.mjs", "suite-auth.mjs", "suite-secrecy.mjs"];
+const ALL = ["suite-core.mjs", "suite-prompt.mjs", "suite-agent.mjs", "suite-codex.mjs", "suite-claude.mjs", "suite-hardening.mjs", "suite-round2.mjs", "suite-round3.mjs", "suite-round4.mjs", "suite-round5.mjs", "suite-stream.mjs", "suite-auth.mjs", "suite-defaults.mjs", "suite-secrecy.mjs"];
 const only = process.argv.slice(2);
 try {
   for (const suite of only.length ? ALL.filter((s) => only.includes(s)) : ALL) {
