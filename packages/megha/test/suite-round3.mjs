@@ -285,7 +285,10 @@ export async function run() {
 
   // ======================= 3. cancelling git ends its whole process tree =======================
   const sockets = new Set();
-  const server = net.createServer((sock) => { sockets.add(sock); sock.on("error", () => {}); sock.on("close", () => sockets.delete(sock)); }); // accepts, never answers, never closes
+  // Accepts and never answers. resume() reads (and drops) what git sends: a socket nobody reads never
+  // sees the peer's FIN, so on Linux/macOS the server side sat in CLOSE_WAIT after git died and the
+  // "connection closed" check failed even though git's whole tree was gone.
+  const server = net.createServer((sock) => { sockets.add(sock); sock.resume(); sock.on("error", () => {}); sock.on("close", () => sockets.delete(sock)); });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   const hangUrl = `http://127.0.0.1:${server.address().port}/acme/tree.git`;
   // Start a stalled ls-remote, wait for its HTTP connection, record git's process tree, end it with

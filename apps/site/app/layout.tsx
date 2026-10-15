@@ -11,7 +11,7 @@ const description =
 
 // The production URL isn't decided yet. Set NEXT_PUBLIC_SITE_URL in Vercel once it is; canonical and
 // og:image URLs are built from it.
-const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "https://megha.vercel.app";
+const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "https://t3-megha.vercel.app";
 
 // og:image and twitter:image come from app/opengraph-image.tsx.
 export const metadata: Metadata = {
