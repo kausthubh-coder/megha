@@ -8,6 +8,7 @@ import {
   log, sleep, sseFrames, tail, repoInfo, UserError, isoFromEpochSeconds, saveSessionRecord, cleanTerminal,
   cachedList, readCache, writeCache, localChanges, localPatch, setupCommandsFor, findPullRequestUrl,
   CloudError, operationLabel, parseJsonBody, throwIfCancelled, boundedSignal, Cancelled, describeError, turnFailed,
+  cloudStateOf, setCloudState, startCloudTurn, stillRunningText,
 } from "./util.mjs";
 import { codexChangesToPatch, diffToolCall, applyLocally, diffFiles } from "./diff.mjs";
 import { imageSize, imageExtension } from "./image.mjs";
@@ -257,7 +258,11 @@ export class CodexBackend {
   // session/load and session/resume of a cloud id: confirm it is this repo's task first.
   async checkRepo(session) {
     session.repo ??= await repoInfo(session.cwd);
-    this.#checkTask(session, await api("GET", `/wham/tasks/${enc(session.cloudId)}`));
+    const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`);
+    this.#checkTask(session, d);
+    // A terminal turn seen here is an observed end. Not saved on its own: if megha stops before the
+    // next save, the record keeps the older state and is simply checked again.
+    if (TERMINAL.has(d?.current_assistant_turn?.turn_status)) session.cloudState = "idle";
   }
 
   // true when Codex Cloud accepted the cancel. Never throws.
@@ -265,20 +270,25 @@ export class CodexBackend {
     try { await api("POST", `/wham/tasks/${enc(session.cloudId)}/cancel`); log("cancel requested"); return true; }
     catch (e) { log(`cancel failed: ${describeError(e)}`); return false; }
   }
-  // Cancel right away (a turn stopped before megha streamed it). If the cloud didn't accept, the next
-  // follow-up checks the turn first.
+  // Cancel right away (a turn stopped before megha streamed it). Accepted or not, the turn has not
+  // been seen to end: the next mutation checks first (#reconcile).
   async #cancelNow(session) {
-    if (!(await this.#cancelTask(session))) session.stopUnconfirmed = true;
+    setCloudState(session, "stop_requested");
+    await this.#cancelTask(session);
   }
 
-  // A turn megha stopped without confirmation (the cancel request failed and no terminal status came
-  // in time) may still be running, and a follow-up would land on top of it. Before one is sent: if
-  // the task's turn is still going, ask again and refuse; once it is terminal, carry on.
-  async #ensureStopped(session, details) {
-    const status = details?.current_assistant_turn?.turn_status;
-    if (!status || TERMINAL.has(status)) { session.stopUnconfirmed = false; return; }
-    const ok = await this.#cancelTask(session);
-    throw new UserError(`The previous Codex Cloud turn hasn't confirmed it stopped; megha ${ok ? "asked" : "tried to ask"} Codex Cloud to cancel it again. Try again in a moment, or stop it at ${session.webUrl ?? taskUrl(session.cloudId)}.`);
+  // Before any mutation (a follow-up, /apply, /pr): unless megha saw the task's last turn end
+  // (cloudState idle, lib/util.mjs), look at the task now. Only a terminal turn_status counts as
+  // ended; in progress, pending or no status at all is refused rather than overlapped, and a turn
+  // megha had asked to stop is asked again. `details`: a GET /wham/tasks/{id} answer just fetched.
+  async #reconcile(session, signal, details = null) {
+    const state = cloudStateOf(session);
+    if (state === "idle") return;
+    const d = details ?? await api("GET", `/wham/tasks/${enc(session.cloudId)}`, undefined, { signal });
+    if (TERMINAL.has(d?.current_assistant_turn?.turn_status)) { setCloudState(session, "idle"); return; }
+    const again = state === "stop_requested" ? await this.#cancelTask(session) : undefined;
+    log(`previous turn not seen to end (${state}); refusing`);
+    throw new UserError(stillRunningText(LABEL, session.webUrl ?? taskUrl(session.cloudId), again));
   }
 
   // Is the repo visible to the ChatGPT GitHub connector (so an environment can be created for it)?
@@ -478,7 +488,7 @@ export class CodexBackend {
         }
       }
       throwIfCancelled(signal);
-      const res = await api("POST", "/wham/tasks", { new_task: { environment_id: environmentId, branch, run_environment_in_qa_mode: cfg.mode !== "code" }, ...metadata, input_items }, { timeoutMs: 60_000 });
+      const res = await startCloudTurn(session, () => api("POST", "/wham/tasks", { new_task: { environment_id: environmentId, branch, run_environment_in_qa_mode: cfg.mode !== "code" }, ...metadata, input_items }, { timeoutMs: 60_000 }));
       session.cloudId = res?.task?.id ?? res?.id;
       if (!session.cloudId) throw new Error("Codex Cloud created a task but returned no id");
       session.webUrl = taskUrl(session.cloudId);
@@ -492,14 +502,14 @@ export class CodexBackend {
     } else {
       const before = await api("GET", `/wham/tasks/${enc(session.cloudId)}`, undefined, { signal });
       this.#checkTask(session, before);
-      if (session.stopUnconfirmed) await this.#ensureStopped(session, before);
+      await this.#reconcile(session, signal, before);
       const prev = before.task?.current_turn_id ?? session.turnId;
       const images = await this.#imageItems(input.images, io);
       throwIfCancelled(signal);
-      const res = await api("POST", "/wham/tasks", {
+      const res = await startCloudTurn(session, () => api("POST", "/wham/tasks", {
         follow_up: { task_id: session.cloudId, turn_id: prev, environment_mode: cfg.mode === "code" ? "code" : "ask" },
         ...metadata, input_items: [message(text), ...images],
-      }, { timeoutMs: 60_000 });
+      }, { timeoutMs: 60_000 }));
       if (signal.aborted) { await this.#cancelNow(session); return "cancelled"; }
       turnId = typeof res?.turn?.id === "string" && res.turn.id.includes("assttrn") && res.turn.id !== prev ? res.turn.id : await this.#waitForNewTurn(session.cloudId, prev, signal);
     }
@@ -528,6 +538,7 @@ export class CodexBackend {
       session.turnId = turn.id;
       return this.#afterTurn(session, await this.#streamTurn(session, turn.id, io), io);
     }
+    setCloudState(session, "idle"); // seen ended
     if (turn.id === session.doneTurnId) return null;
     log(`showing turn ${turn.id} that finished while detached`);
     session.turnId = turn.id;
@@ -571,17 +582,26 @@ export class CodexBackend {
     const st = new TurnState(session, io, turnId);
     const ac = new AbortController(); // aborts once the turn has an outcome: ends the stream and the poller
     let finished = null;
-    const finish = (r) => { if (!finished) { finished = r; ac.abort(); } };
+    // r.observed: the cloud itself reported the turn's end (turn/completed on the stream, or a terminal
+    // status from a poll), the only thing that makes the task idle again.
+    const finish = (r) => {
+      if (finished) return;
+      finished = r;
+      if (r.observed) setCloudState(session, "idle");
+      ac.abort();
+    };
     // Stop and the turn's time limit end a turn the same way: ask the cloud to cancel it, then keep
     // watching for the terminal status for at most stopWaitMs. The cancel request belongs to the turn
     // (io.turn.track): the next prompt waits for its answer, even if the stream reports the end first.
-    let stopping = null, cancelRequest = null, stopTimer = null;
+    // An accepted cancel is not an ended turn: without a terminal status the state stays stop_requested.
+    let stopping = null, stopTimer = null;
     const wake = new AbortController();
     const stop = (reason) => {
       if (stopping || finished) return;
       stopping = reason;
+      setCloudState(session, "stop_requested");
       log(reason === "timeout" ? "turn time limit reached; cancelling it in the cloud" : "stopping the cloud turn");
-      cancelRequest = io.turn.track(this.#cancelTask(session), "cloud cancel");
+      io.turn.track(this.#cancelTask(session), "cloud cancel");
       stopTimer = setTimeout(() => finish({ status: "cancelled", unconfirmed: true }), this.stopWaitMs);
       wake.abort();
     };
@@ -606,7 +626,7 @@ export class CodexBackend {
             if (d.item_type === "log") { st.setupLog(d.line); continue; }
             if (d.item_type !== "thread_event" || !d.event?.method) continue;
             const r = st.handle(d.event.method, d.event.params ?? {});
-            if (r) { finish({ ...r, via: "stream" }); return; }
+            if (r) { finish({ ...r, via: "stream", observed: true }); return; }
           }
         } catch (e) {
           if (finished || ac.signal.aborted) return;
@@ -632,7 +652,7 @@ export class CodexBackend {
             if (finished) return;
             st.catchUp(turn.thread_events?.events ?? []);
             st.fallbackMessages(turnMessages(turn));
-            finish({ status: turn.turn_status, code: turnErrorCode(turn.error), via: "poll" });
+            finish({ status: turn.turn_status, code: turnErrorCode(turn.error), via: "poll", observed: true });
             return;
           }
         } catch (e) {
@@ -649,9 +669,6 @@ export class CodexBackend {
     io.signal.removeEventListener("abort", onAbort);
     st.closeSetup();
     log(`turn ${finished?.status} via ${finished?.via ?? "?"}${finished?.unconfirmed ? " (stop not confirmed)" : ""}`);
-    // Stopped, the cloud never confirmed it and the cancel request failed: the turn may still run, so
-    // the next follow-up checks it first (#ensureStopped).
-    if (cancelRequest) io.turn.track(cancelRequest.then((ok) => { session.stopUnconfirmed = !ok && !!finished?.unconfirmed; }), "cloud cancel");
     if (stopping === "timeout" && finished?.status !== "completed") {
       const limit = `${Math.round(this.turnTimeoutMs / 60_000)} min`;
       return { status: "failed", error: turnFailed(LABEL, { guidance: `It timed out after ${limit}, so megha asked Codex Cloud to cancel it (${session.webUrl ?? taskUrl(session.cloudId)}).` }) };
@@ -667,7 +684,7 @@ export class CodexBackend {
     // The PR endpoint wants the turn that holds the diff.
     const diffTurn = turnDiff(d.current_diff_task_turn) ? d.current_diff_task_turn : turnDiff(d.current_assistant_turn) ? d.current_assistant_turn : null;
     return { diff: turnDiff(diffTurn), turnId: diffTurn?.id ?? session.turnId,
-      stats: d.task?.task_status_display?.latest_turn_status_display?.diff_stats, task: d.task };
+      stats: d.task?.task_status_display?.latest_turn_status_display?.diff_stats, task: d.task, details: d };
   }
 
   async #finishDiff(session, io) {
@@ -702,16 +719,22 @@ export class CodexBackend {
         const d = await api("GET", `/wham/tasks/${enc(session.cloudId)}`, undefined, { signal: io.signal });
         this.#checkTask(session, d);
         const t = d.current_assistant_turn ?? {};
+        // /status is how a user clears a refused prompt: a terminal turn seen here counts as the end.
+        if (TERMINAL.has(t.turn_status)) setCloudState(session, "idle");
         const disp = d.task?.task_status_display ?? {};
         const st = disp.latest_turn_status_display?.diff_stats;
         io.text([`**${d.task?.title ?? "Cloud task"}**`, `Status: ${t.turn_status ?? disp.latest_turn_status_display?.turn_status ?? "unknown"}`,
           `Environment: ${disp.environment_label ?? session.config.environment}`, `Branch: ${disp.branch_name ?? t.branch ?? "?"}`,
           `Model: ${t.model_version ?? session.config.model}`, ...(st ? [`Diff: ${st.files_modified ?? 0} files (+${st.lines_added ?? 0} -${st.lines_removed ?? 0})`] : []),
-          ...(session.prUrl ? [`Pull request: ${session.prUrl}`] : []), `[Open in Codex Cloud](${session.webUrl})`].join("\n"));
+          ...(session.prUrl ? [`Pull request: ${session.prUrl}`] : []),
+          ...(cloudStateOf(session) === "idle" ? [] : ["megha hasn't seen the last turn end yet, so new prompts wait until it does."]),
+          `[Open in Codex Cloud](${session.webUrl})`].join("\n"));
         return;
       }
       case "apply": {
-        const { diff, turnId } = await this.#latestDiff(session, io.signal);
+        const { diff, turnId, details } = await this.#latestDiff(session, io.signal);
+        // A turn still running changes its diff: apply only once it is seen to have ended.
+        await this.#reconcile(session, io.signal, details);
         if (!diff) { io.text("The cloud task has no diff to apply yet."); return; }
         throwIfCancelled(io.signal);
         const r = await applyLocally({ cwd: session.cwd, diff, name: `${session.cloudId}-${String(turnId).split("~").pop()}`, previousFile: session.appliedPatchFile, signal: io.signal });
@@ -726,10 +749,11 @@ export class CodexBackend {
           io.text(`This task already has a pull request: ${session.prUrl}${linked ? `\n\n${linked}` : ""}`);
           return;
         }
-        const { diff, turnId, task } = await this.#latestDiff(session, io.signal);
+        const { diff, turnId, task, details } = await this.#latestDiff(session, io.signal);
         const existing = findPullRequestUrl(task?.external_pull_requests);
         if (existing) session.prUrl = existing;
         else {
+          await this.#reconcile(session, io.signal, details);
           if (!diff) { io.text("The cloud task has no diff yet, so there is nothing to open a pull request from."); return; }
           throwIfCancelled(io.signal);
           const res = await api("POST", `/wham/tasks/${enc(session.cloudId)}/turns/${enc(turnId)}/pr`, args === "draft" ? { mode: "draft" } : {}, { timeoutMs: 60_000 });

@@ -69,7 +69,7 @@ export async function run({ logins }) {
       ["POST", new RegExp(`^${AN}/v1/code/sessions/cse_sec/events$`), () => (fail ? json({ error: { type: "invalid_request_error", message: CANARY.serverBody } }, 400) : json({ results: [{ sequence_num: "2" }] }))],
       ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_sec/events/stream$`), (req) => sse([{ event: "client_event", id: "9", data: { sequence_num: "9", source: "worker", payload: { type: "result", subtype: "success", is_error: false } } }])],
       ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_sec$`), () => (fail ? json({ error: { message: CANARY.serverBody } }, 502)
-        : json({ session: { id: "cse_sec", title: "t", external_metadata: { last_init_error: CANARY.initError } } }))],
+        : json({ session: { id: "cse_sec", worker_status: "idle", title: "t", external_metadata: { last_init_error: CANARY.initError } } }))],
     ]);
     const a = new MeghaAgent(fakeConn(), new ClaudeBackend({ statusPollMs: 50 }), { env: {} });
     const { sessionId } = await a.newSession({ cwd: repo, mcpServers: [] });
@@ -116,7 +116,7 @@ export async function run({ logins }) {
       ["GET", new RegExp(`^${AN}/v1/models$`), () => json({ data: [{ id: "claude-opus-5-5", display_name: "Claude Opus 5.5" }] })],
       ["POST", new RegExp(`^${AN}/v1/code/sessions/cse_fail/events$`), () => json({ results: [{ sequence_num: String(seq += 10) }] })],
       ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_fail/events/stream$`), () => sse([{ event: "client_event", id: String(seq + 1), data: { sequence_num: String(seq + 1), source: "worker", payload: { type: "result", ...results.shift() } } }])],
-      ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_fail$`), () => json({ session: { id: "cse_fail", title: "t", external_metadata: { last_init_error: diag } } })],
+      ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_fail$`), () => json({ session: { id: "cse_fail", worker_status: "idle", title: "t", external_metadata: { last_init_error: diag } } })],
     ]);
     const c = new MeghaAgent(fakeConn(), new ClaudeBackend({ statusPollMs: 60_000 }), { env: {} });
     const cs = await c.newSession({ cwd: crepo, mcpServers: [] });

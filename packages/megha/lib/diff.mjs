@@ -2,7 +2,7 @@
 
 import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join, isAbsolute } from "node:path";
-import { DATA_DIR, git, log, Cancelled, throwIfCancelled } from "./util.mjs";
+import { DATA_DIR, git, log, Cancelled, RecoveryNeeded, throwIfCancelled } from "./util.mjs";
 
 const MAX_DIFF_CHARS = 400_000;
 
@@ -100,8 +100,16 @@ function savePatch(name, diff) {
 //
 // signal: the turn's Stop. The read-only git steps (rev-parse, the --check preflights, status) are
 // killed by it; each step that changes the working tree checks it right before it starts and is never
-// killed once running. A Stop after the previous diff was reversed puts it back, then throws
-// Cancelled, so a stopped turn leaves the checkout as it found it. `run` replaces git in tests.
+// killed by Stop once running. A Stop after the previous diff was reversed puts it back, then throws
+// Cancelled, so a stopped turn leaves the checkout as it found it.
+//
+// Nothing here is assumed. The shared git timeout can still kill a step that changes the tree
+// (git() answers { timedOut: true } once the process is gone), so such a step is followed by --check
+// probes that tell whether its patch is now fully in, not in at all, or partly in. Putting the
+// previous diff back is checked the same way. When the checkout is not as megha meant to leave it,
+// the result says so, with the saved patch files and the exact commands to recover; a Stop that hits
+// such a failure throws RecoveryNeeded (shown to the user) instead of Cancelled. `run` replaces git
+// in tests.
 export async function applyLocally({ cwd, diff, name, previousFile, signal, run = git }) {
   const read = (dir, args) => { throwIfCancelled(signal); return run(dir, args, { signal }); };
   const change = (dir, args) => { throwIfCancelled(signal); return run(dir, args); };
@@ -112,29 +120,68 @@ export async function applyLocally({ cwd, diff, name, previousFile, signal, run 
   if (top.code !== 0) return { ok: false, message: `Not applied: ${cwd} is not a git repository. Patch saved to ${patchFile}.` };
   const root = top.stdout.trim();
   if (previous === diff) return { ok: true, patchFile, unchanged: true, message: "The cloud diff is unchanged since the last apply; nothing to do." };
+  const cmd = (args) => `\`git -C "${root}" ${args}\``;
+  const files = diffFiles(diff).map((f) => f.path);
+  const n = files.length;
+
+  // Where a `git apply [-R] <file>` that the timeout killed left the tree, from its own --check
+  // probes (no signal: megha must know, even after Stop): "done" (fully applied, or fully reversed
+  // with -R), "none" (untouched) or "partial" (neither; partly written, or the probes can't tell).
+  const killedOutcome = async (file, reverse) => {
+    if ((await run(root, ["apply", ...(reverse ? [] : ["-R"]), "--check", file])).code === 0) return "done";
+    if ((await run(root, ["apply", ...(reverse ? ["-R"] : []), "--check", file])).code === 0) return "none";
+    return "partial";
+  };
+  // One tree-changing `git apply`. git apply is all or nothing when it runs to its end, so a non-zero
+  // exit changed nothing; only a kill by the timeout needs the probes.
+  const step = async (args, file) => {
+    const res = await change(root, args);
+    const outcome = res.timedOut ? await killedOutcome(file, args.includes("-R")) : res.code === 0 ? "done" : "none";
+    return { res, outcome };
+  };
 
   let prevFile = null;
   if (previous) {
     const file = savePatch(`${name}-previous`, previous);
     const rev = await read(root, ["apply", "-R", "--check", file]);
     if (rev.code === 0) {
-      if ((await change(root, ["apply", "-R", file])).code === 0) prevFile = file;
+      const { outcome } = await step(["apply", "-R", file], file);
+      if (outcome === "done") prevFile = file;
+      else if (outcome === "partial") {
+        return { ok: false, message: `Not applied: undoing the cloud diff applied before was stopped by its time limit partway through, so the files it touches (${diffFiles(previous).map((f) => f.path).slice(0, 8).join(", ")}) are partly changed. Saved patches: the earlier diff is ${file}, the new one ${patchFile}. See what changed with ${cmd("diff")}. Once those files are as you want them, ${cmd(`apply --check "${patchFile}"`)} shows whether the new diff applies.` };
+      }
     } else {
       log("previous diff no longer reverses cleanly; applying the new diff on top");
     }
   }
-  // Put the reversed previous diff back (no signal: this undo must run to the end).
-  const restore = async () => { if (prevFile) await run(root, ["apply", prevFile]); };
+  // Put the reversed previous diff back (no signal: this undo must run to the end) and check that it
+  // is back. null when it is (or nothing was reversed); otherwise the failure, with recovery steps.
+  const restore = async () => {
+    if (!prevFile) return null;
+    const res = await run(root, ["apply", prevFile]);
+    const back = await run(root, ["apply", "-R", "--check", prevFile]);
+    if ((res.code === 0 || res.timedOut) && back.code === 0) return null;
+    return `megha could not put back the cloud diff it had applied before: it reversed that diff to make room for the new one, and \`git apply\` of it then ${res.timedOut ? "was stopped by its time limit" : "failed"} (the files may have changed meanwhile). Your checkout may have neither diff. Saved patches: the earlier diff is ${prevFile}, the new one ${patchFile}. See what changed with ${cmd("diff")}. To put the earlier diff back once the files allow it: ${cmd(`apply "${prevFile}"`)} (${cmd(`apply --check "${prevFile}"`)} tells you if it will). To apply the new one instead: ${cmd(`apply "${patchFile}"`)}.`;
+  };
+  const partlyApplied = (what) => {
+    const prevNote = prevFile ? ` The cloud diff applied before was reversed first; it is saved at ${prevFile}.` : "";
+    return `Not applied: ${what} was stopped by its time limit partway through, so the checkout is partly changed (${files.slice(0, 8).join(", ")}). The new diff is saved at ${patchFile}.${prevNote} See what changed with ${cmd(`diff -- ${files.slice(0, 8).map((f) => `"${f}"`).join(" ")}`)}. ${cmd(`apply -R --check "${patchFile}"`)} succeeds once the diff is fully in; ${cmd(`apply --check "${patchFile}"`)} once none of it is.`;
+  };
 
   try {
-    const files = diffFiles(diff).map((f) => f.path);
-    const n = files.length;
     const swapped = prevFile ? ", replacing the previously applied diff" : "";
+    const applied = (how) => ({ ok: true, patchFile, message: `Applied the cloud diff ${how} (${n} file${n === 1 ? "" : "s"}${swapped}).` });
     const check = await read(root, ["apply", "--check", patchFile]);
     if (check.code === 0) {
       // Applies cleanly: a plain apply touches only the working tree (no index changes).
-      const res = await change(root, ["apply", patchFile]);
-      if (res.code === 0) return { ok: true, patchFile, message: `Applied the cloud diff to your working tree (${n} file${n === 1 ? "" : "s"}${swapped}).` };
+      const { res, outcome } = await step(["apply", patchFile], patchFile);
+      if (outcome === "done") return applied("to your working tree");
+      if (outcome === "partial") return { ok: false, message: partlyApplied("`git apply` of the cloud diff") };
+      if (res.timedOut) {
+        const failed = await restore();
+        if (failed) return { ok: false, message: `Not applied: \`git apply\` was stopped by its time limit before it changed anything, and ${failed}` };
+        return { ok: false, message: `Not applied: \`git apply\` did not finish within its time limit and was stopped before it changed anything. Nothing was changed. Patch saved to ${patchFile}.` };
+      }
     }
     // Does not apply cleanly. Fall back to a 3-way merge, but only when the touched files have no local
     // edits (--3way works through the index and we must not clobber unstaged work).
@@ -142,19 +189,27 @@ export async function applyLocally({ cwd, diff, name, previousFile, signal, run 
     const dirty = (await read(root, ["status", "--porcelain", "--", ...files])).stdout.trim();
     if (!dirty) {
       const res = await change(root, ["apply", "--3way", patchFile]);
+      // A 3-way apply works file by file through the index; one the timeout killed can't be probed.
+      if (res.timedOut) return { ok: false, message: partlyApplied("`git apply --3way` of the cloud diff") };
       const conflicted = [...res.stderr.matchAll(/Applied patch to '([^']+)' with conflicts/g)].map((m) => m[1]);
-      if (res.code === 0) return { ok: true, patchFile, message: `Applied the cloud diff with a 3-way merge (${n} file${n === 1 ? "" : "s"}${swapped}).` };
+      if (res.code === 0) return applied("with a 3-way merge");
       if (conflicted.length) {
         return { ok: false, message: `Applied with conflicts in ${conflicted.join(", ")}: resolve the conflict markers there (the changes are staged by git apply --3way). Patch saved to ${patchFile}.` };
       }
     }
-    await restore();
-    return {
-      ok: false,
-      message: `Not applied: the cloud diff does not apply cleanly${failing.length ? ` (${failing.slice(0, 8).join(", ")})` : ""}${dirty ? " and the touched files have local edits" : ""}. Nothing was changed. Patch saved to ${patchFile}.`,
-    };
+    const why = `the cloud diff does not apply cleanly${failing.length ? ` (${failing.slice(0, 8).join(", ")})` : ""}${dirty ? " and the touched files have local edits" : ""}`;
+    const failed = await restore();
+    if (failed) return { ok: false, message: `Not applied: ${why}, and ${failed}` };
+    return { ok: false, message: `Not applied: ${why}. Nothing was changed. Patch saved to ${patchFile}.` };
   } catch (e) {
-    if (e instanceof Cancelled) { await restore(); log("apply stopped; the checkout is as it was"); }
+    // Only reads and the checks before a change throw here, so the new diff was not applied: undo the
+    // reversal of the previous one, and say what really happened.
+    const failed = await restore();
+    if (failed) {
+      log("apply stopped, and putting the previous diff back failed");
+      throw new RecoveryNeeded(`${e instanceof Cancelled ? "Stopped while applying the cloud diff" : "Applying the cloud diff failed"}, and ${failed}`);
+    }
+    if (e instanceof Cancelled) log(prevFile ? "apply stopped; the previous diff is back and checked" : "apply stopped before changing anything");
     throw e;
   }
 }

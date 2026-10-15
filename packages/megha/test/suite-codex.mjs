@@ -178,7 +178,7 @@ export async function run() {
     const mcp = [];
     calls = mockFetch([
       ["GET", new RegExp(`^${API}/wham/tasks/task_e_pr$`), () => json({ task: { id: "task_e_pr", external_pull_requests: [] },
-        current_diff_task_turn: { id: "task_e_pr~assttrn_e_5", output_items: [{ type: "pr", output_diff: { diff } }] }, current_assistant_turn: { id: "task_e_pr~assttrn_e_6", output_items: [], ...WIDGET_ENV } })],
+        current_diff_task_turn: { id: "task_e_pr~assttrn_e_5", output_items: [{ type: "pr", output_diff: { diff } }] }, current_assistant_turn: { id: "task_e_pr~assttrn_e_6", turn_status: "completed", output_items: [], ...WIDGET_ENV } })],
       ["POST", new RegExp(`^${API}/wham/tasks/task_e_pr/turns/task_e_pr~assttrn_e_5/pr$`), () => json({ pull_request: { url: "https://github.com/acme/widget/pull/9" } })],
       ["POST", /^127\.0\.0\.1:4999\/mcp$/, (req) => {
         mcp.push(req.body);

@@ -79,11 +79,19 @@ T3 on Windows refuses `.cmd` shims, so `commandPath` must be `node.exe` and the 
   in an attachment line is named in the prompt and not read.
 - Cancel answers T3 within about 1.5 s. The cloud cancel and the end of the cloud turn finish in the
   background. After Stop, megha starts no new cloud or local work for that turn: no automatic local
-  apply, no late permission answer, and git calls in flight are stopped. If Stop lands in the middle
-  of `/apply`, the checkout is left as it was. The next prompt (a steer) waits up to 60 s for the
-  stopped turn to settle, including the cloud's answer to the cancel, and is refused if it hasn't.
-- A turn that runs past megha's 3-hour limit is cancelled in the cloud the same way. If the cloud
-  never confirms a stop, the next prompt checks the task first and is refused while it still runs.
+  apply, and no late permission answer. A permission prompt stops counting as soon as the turn
+  starts ending (Stop, the time limit, or the cloud's result). git calls in flight are stopped
+  together with every process they started. If Stop lands in the middle of `/apply`, megha puts the
+  checkout back and checks that it did. If it can't, it tells you so, with the saved patch files and
+  the git commands to recover. The next prompt (a steer) waits up to 60 s for the stopped turn to
+  settle, including the cloud's answer to the cancel, and is refused if it hasn't.
+- A turn that runs past megha's 3-hour limit is cancelled in the cloud the same way.
+- megha saves in its session record whether it has seen the cloud turn end. An accepted cancel
+  doesn't count, and neither does a prompt request whose answer never came. Until the cloud reports
+  the end, the next prompt, `/apply` or `/pr` checks the cloud first and is refused while the turn
+  still runs, also after a restart. `/status` shows the cloud's status and clears the wait once the
+  turn has ended.
+- Loading or resuming a session in another folder checks it against that folder's repo again.
 - Cloud errors, including failed turns, show the operation, the HTTP status and a known error code.
   megha never shows or logs the cloud's own error text or the response body.
 - megha only lists, imports or continues tasks and sessions of the folder's repo. For Codex it

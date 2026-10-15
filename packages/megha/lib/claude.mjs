@@ -6,12 +6,12 @@
 import { readFileSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import crypto from "node:crypto";
 import {
   log, sleep, sseFrames, tail, git, repoInfo, UserError, saveSessionRecord, allSessionRecords, cleanTerminal, cachedList, localChanges,
   CloudError, operationLabel, parseJsonBody, throwIfCancelled, boundedSignal, Cancelled, describeError, turnFailed, provenanceOf,
-  GIT_NETWORK_TIMEOUT_MS,
+  GIT_NETWORK_TIMEOUT_MS, samePath, cloudStateOf, setCloudState, startCloudTurn, stillRunningText,
 } from "./util.mjs";
 import { diffToolCall, applyLocally, diffFiles } from "./diff.mjs";
 
@@ -217,7 +217,6 @@ function sessionRepo(s) {
   return sourceRepo(s) ?? (typeof out === "string" ? out.toLowerCase() : null);
 }
 const fullName = (repo) => (repo?.github ? `${repo.github.owner}/${repo.github.name}`.toLowerCase() : null);
-const samePath = (a, b) => !!a && !!b && (process.platform === "win32" ? resolve(a).toLowerCase() === resolve(b).toLowerCase() : resolve(a) === resolve(b));
 // Shown when the container never comes up. last_init_error itself is server text and is never shown.
 const STARTUP_FAILED = "Claude could not start the cloud session's container; open the session on claude.ai to see why.";
 // Claude Code SDK result subtypes named in megha's failure message. result.result is the cloud's own
@@ -358,6 +357,9 @@ export class ClaudeBackend {
     this.#checkSession(session, s);
     this.#hydrate(session, s);
     session.lastInitError = s.external_metadata?.last_init_error ?? null;
+    // An idle worker seen here is an observed end of the last turn. Not saved on its own: if megha
+    // stops before the next save, the record keeps the older state and is simply checked again.
+    if (s.worker_status === "idle") session.cloudState = "idle";
     return s;
   }
 
@@ -384,18 +386,25 @@ export class ClaudeBackend {
     try { await this.#interrupt(session); log("interrupt sent"); return true; }
     catch (e) { log(`interrupt failed: ${describeError(e)}`); return false; }
   }
+  // Stop a turn megha just started (Stop arrived while its request was in flight). Accepted or not,
+  // the turn has not been seen to end: the next mutation checks first (#reconcile).
   async #interruptNow(session) {
-    if (!(await this.#interruptQuietly(session))) session.stopUnconfirmed = true;
+    setCloudState(session, "stop_requested");
+    await this.#interruptQuietly(session);
   }
 
-  // A turn megha stopped without confirmation (the interrupt failed and no result came in time) may
-  // still be running, and a new prompt would queue behind it. Before one is sent: if the session is
-  // still working, interrupt again and refuse; once it is idle, carry on.
-  async #ensureStopped(session, signal) {
-    const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal }));
-    if (s.worker_status !== "running" && s.worker_status !== "requires_action") { session.stopUnconfirmed = false; return; }
-    const ok = await this.#interruptQuietly(session);
-    throw new UserError(`The previous Claude cloud turn hasn't confirmed it stopped; megha ${ok ? "asked" : "tried to ask"} it to stop again. Try again in a moment, or stop it at ${session.webUrl ?? this.webUrl(session.cloudId)}.`);
+  // Before any mutation (a prompt, /apply): unless megha saw the session's last turn end (cloudState
+  // idle, lib/util.mjs), look at the session now. Only worker_status "idle" counts as ended; running,
+  // requires_action or no status at all is refused rather than overlapped, and a turn megha had asked
+  // to stop is asked again. `known`: a session object just fetched, to save a GET.
+  async #reconcile(session, signal, known = null) {
+    const state = cloudStateOf(session);
+    if (state === "idle") return;
+    const s = known ?? unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal }));
+    if (s.worker_status === "idle") { setCloudState(session, "idle"); return; }
+    const again = state === "stop_requested" ? await this.#interruptQuietly(session) : undefined;
+    log(`previous turn not seen to end (${state}, worker ${["running", "requires_action"].includes(s.worker_status) ? s.worker_status : "status unknown"}); refusing`);
+    throw new UserError(stillRunningText(LABEL, session.webUrl ?? this.webUrl(session.cloudId), again));
   }
 
   // ---------- prompt ----------
@@ -414,14 +423,14 @@ export class ClaudeBackend {
       await this.#create(session, input, io);
       if (signal.aborted) { await this.#interruptNow(session); return "cancelled"; }
     } else {
-      if (!session.repoChecked) await this.checkRepo(session, signal);
-      if (session.stopUnconfirmed) await this.#ensureStopped(session, signal);
+      const checked = session.repoChecked ? null : await this.checkRepo(session, signal);
+      await this.#reconcile(session, signal, checked);
       const events = [];
       if (session.sentMode !== session.config.mode) events.push({ payload: { type: "control_request", request_id: `set-mode-${crypto.randomUUID()}`, request: { subtype: "set_permission_mode", mode: session.config.mode }, uuid: crypto.randomUUID() } });
       if (session.sentModel !== session.config.model) events.push({ payload: { type: "control_request", request_id: `set-model-${crypto.randomUUID()}`, request: { subtype: "set_model", model: session.config.model }, uuid: crypto.randomUUID() } });
       events.push({ payload: { uuid: crypto.randomUUID(), session_id: session.cloudId, type: "user", parent_tool_use_id: null, message: { role: "user", content: userContent(input.text, input.images) } } });
       throwIfCancelled(signal);
-      const r = await api("POST", `/v1/code/sessions/${enc(session.cloudId)}/events`, { body: { events }, timeoutMs: 60_000 });
+      const r = await startCloudTurn(session, () => api("POST", `/v1/code/sessions/${enc(session.cloudId)}/events`, { body: { events }, timeoutMs: 60_000 }));
       userSeq = Number(r.results?.at(-1)?.sequence_num ?? 0);
       fromSeq = session.lastSeq ?? 0;
       session.sentMode = session.config.mode;
@@ -465,7 +474,10 @@ export class ClaudeBackend {
       pending = (j.data ?? []).some((row) => row.payload?.type === "result" && !row.payload.parent_tool_use_id && Number(row.sequence_num) > (session.lastSeq ?? 0));
       if (pending) io.text("The cloud turn finished while T3 Code was away. Its result:\n\n");
     }
-    if (!pending) return null;
+    if (!pending) {
+      if (s.worker_status === "idle") setCloudState(session, "idle"); // seen ended: the follow-up needn't ask again
+      return null;
+    }
     log(`reattaching from sequence ${session.lastSeq ?? 0}`);
     return this.#afterTurn(session, await this.#streamTurn(session, io, session.lastSeq ?? 0, 0), io);
   }
@@ -529,9 +541,9 @@ export class ClaudeBackend {
       const full = `${repo.github.owner}/${repo.github.name}`;
       try {
         throwIfCancelled(signal);
-        created = await api("POST", "/v1/sessions", { beta: BETA_CCR, timeoutMs: 60_000, body: { ...base, session_context: {
+        created = await startCloudTurn(session, () => api("POST", "/v1/sessions", { beta: BETA_CCR, timeoutMs: 60_000, body: { ...base, session_context: {
           sources: [{ type: "git_repository", url: `https://github.com/${full}`, revision }],
-          outcomes: [{ type: "git_repository", git_info: { type: "github", repo: full, branches: [outcomeBranch] } }], ...model } } });
+          outcomes: [{ type: "git_repository", git_info: { type: "github", repo: full, branches: [outcomeBranch] } }], ...model } } }));
         session.bundle = false;
         session.outcomeBranch = outcomeBranch;
         session.baseBranch = revision;
@@ -546,7 +558,7 @@ export class ClaudeBackend {
       throwIfCancelled(signal);
       const b = await this.#bundle(session, repo, sendLocal, signal);
       throwIfCancelled(signal);
-      created = await api("POST", "/v1/sessions", { beta: BETA_CCR, timeoutMs: 60_000, body: { ...base, session_context: { sources: [], outcomes: [], seed_bundle_file_id: b.fileId, ...model } } });
+      created = await startCloudTurn(session, () => api("POST", "/v1/sessions", { beta: BETA_CCR, timeoutMs: 60_000, body: { ...base, session_context: { sources: [], outcomes: [], seed_bundle_file_id: b.fileId, ...model } } }));
       session.bundle = true;
       const what = b.stashed ? "your local repo including uncommitted tracked changes" : "your committed work";
       const why = sendLocal ? "\"Send local changes\" is on, so the session was seeded from"
@@ -574,17 +586,29 @@ export class ClaudeBackend {
     const st = new ClaudeTurn(session, io);
     const ac = new AbortController(); // aborts once the turn has an outcome: ends the stream and the poller
     let finished = null;
-    const finish = (r) => { if (!finished) { finished = r; ac.abort(); } };
+    // r.observed: the cloud itself reported the turn's end (a result row, or session status failed),
+    // the only thing that makes the session idle again. Whatever ends it, the turn's permission
+    // prompts stop being answerable now, not when its cleanup is done.
+    const finish = (r) => {
+      if (finished) return;
+      finished = r;
+      io.turn.closePermissions();
+      if (r.observed) setCloudState(session, "idle");
+      ac.abort();
+    };
     const timers = [];
     // Stop and the turn's time limit end a turn the same way: interrupt the cloud session, then keep
     // reading for its result for at most stopWaitMs. The interrupt request belongs to the turn
-    // (io.turn.track): the next prompt waits for its answer, even if the result arrives first.
-    let stopping = null, interruptRequest = null;
+    // (io.turn.track): the next prompt waits for its answer, even if the result arrives first. An
+    // accepted interrupt is not an ended turn: without a result the state stays stop_requested.
+    let stopping = null;
     const stop = (reason) => {
       if (stopping || finished) return;
       stopping = reason;
+      io.turn.closePermissions();
+      setCloudState(session, "stop_requested");
       log(reason === "timeout" ? "turn time limit reached; interrupting the cloud session" : "stopping the cloud turn");
-      interruptRequest = io.turn.track(this.#interruptQuietly(session), "interrupt");
+      io.turn.track(this.#interruptQuietly(session), "interrupt");
       timers.push(setTimeout(() => finish({ status: "cancelled", unconfirmed: true }), this.stopWaitMs));
     };
     const onAbort = () => stop("cancel");
@@ -605,7 +629,9 @@ export class ClaudeBackend {
           if (s.status === "failed" || (initError && initError !== session.lastInitError)) {
             session.lastInitError = initError;
             log("the cloud session failed to start");
-            finish({ status: "failed", error: turnFailed(LABEL, { guidance: STARTUP_FAILED }) });
+            // A failed session is an end the cloud reported; a new startup error alone is not (the
+            // container may retry), so that one is checked again before the next prompt.
+            finish({ status: "failed", error: turnFailed(LABEL, { guidance: STARTUP_FAILED }), observed: s.status === "failed" });
             return;
           }
         } catch (e) {
@@ -641,7 +667,7 @@ export class ClaudeBackend {
           if (seq && seq <= lastSeq) continue;
           if (seq) { lastSeq = seq; session.lastSeq = seq; }
           const r = st.handle(row, { live: true });
-          if (r && seq > userSeq) { finish(r); break; }
+          if (r && seq > userSeq) { finish({ ...r, observed: true }); break; }
         }
       } catch (e) {
         if (finished || ac.signal.aborted) break;
@@ -654,9 +680,6 @@ export class ClaudeBackend {
     for (const t of timers) clearTimeout(t);
     io.signal.removeEventListener("abort", onAbort);
     st.closeSetup();
-    // Stopped, no result came in time and the interrupt failed: the turn may still run, so the next
-    // prompt checks the session first (#ensureStopped).
-    if (interruptRequest) io.turn.track(interruptRequest.then((ok) => { session.stopUnconfirmed = !ok && !!finished?.unconfirmed; }), "interrupt");
     try {
       const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal: io.signal }));
       session.title = s.title ?? session.title;
@@ -670,20 +693,21 @@ export class ClaudeBackend {
     return { status, error: finished?.error, code: finished?.code };
   }
 
-  // Ask T3 about a can_use_tool request and send the answer, unless the turn stopped or finished in
-  // the meantime: then nothing is sent (the interrupt or the turn's end already settled the request),
-  // so an old prompt approved late can never allow a tool.
+  // Ask T3 about a can_use_tool request and send the answer, unless the cloud turn began ending in the
+  // meantime (Stop, the deadline, or its result; Turn.permissionsValid): then nothing is sent (the
+  // interrupt or the turn's end already settled the request), so an old prompt approved late can
+  // never allow a tool.
   async #answerPermission(session, row, io) {
     const req = row.payload.request ?? {};
     const toolCallId = req.tool_use_id ?? `perm:${row.payload.request_id}`;
-    if (!io.turn.live) return;
+    if (!io.turn.permissionsValid) return;
     const asked = io.requestPermission({
       sessionId: session.id,
       toolCall: { toolCallId, title: `${req.tool_name ?? "Tool"}${req.input?.command ? `: ${req.input.command}` : ""}`, kind: toolKind(req.tool_name), status: "pending", rawInput: req.input ?? {} },
       options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Deny", kind: "reject_once" }],
     }).catch((e) => { log(`permission request failed: ${describeError(e)}`); return null; });
-    const r = await Promise.race([asked, io.turn.ended.then(() => null)]);
-    if (!io.turn.live) { log("permission answered after the turn stopped; not sent"); return; }
+    const r = await Promise.race([asked, io.turn.permissionsClosed.then(() => null)]);
+    if (!io.turn.permissionsValid) { log("permission answered after the cloud turn began ending; not sent"); return; }
     const allow = r?.outcome?.outcome === "selected" && r.outcome.optionId === "allow";
     const response = allow ? { behavior: "allow", updatedInput: req.input ?? {} } : { behavior: "deny", message: "The user denied this in T3 Code." };
     await api("POST", `/v1/code/sessions/${enc(session.cloudId)}/events`, { body: { events: [{ payload: { type: "control_response", response: { subtype: "success", request_id: row.payload.request_id, response } } }] } });
@@ -767,14 +791,19 @@ export class ClaudeBackend {
       case "status": {
         const s = unwrap(await api("GET", `/v1/code/sessions/${enc(session.cloudId)}`, { signal: io.signal }));
         this.#checkSession(session, s);
+        // /status is how a user clears a refused prompt: an idle worker seen here counts as the end.
+        if (s.worker_status === "idle") setCloudState(session, "idle");
         io.text([`**${s.title ?? session.title ?? "Cloud session"}**`, `Status: ${s.worker_status ?? s.status ?? "unknown"}`,
           `Model: ${s.config?.model ?? session.config.model}`, `Permission mode: ${s.config?.permission_mode ?? session.config.mode}`,
           session.bundle ? "Source: git bundle (can't push a branch)" : `Branch: ${session.outcomeBranch ?? "?"}`,
+          ...(cloudStateOf(session) === "idle" ? [] : ["megha hasn't seen the last turn end yet, so new prompts wait until it does."]),
           `[Open in Claude Code on the web](${session.webUrl})`].join("\n"));
         return;
       }
       case "apply": {
-        if (!session.repoChecked) await this.checkRepo(session, io.signal);
+        // A turn still running can push again mid-apply: apply only once it is seen to have ended.
+        const checked = session.repoChecked ? null : await this.checkRepo(session, io.signal);
+        await this.#reconcile(session, io.signal, checked);
         const r = await this.#branchDiff(session, io.signal);
         if (r.reason === "bundle") { io.text("This session was seeded from a git bundle, so it can't push a branch to apply. Open it on claude.ai to see its changes."); return; }
         if (r.reason === "no-base") { io.text(this.#noBaseText(session, r)); return; }

@@ -3,7 +3,7 @@
 
 import crypto from "node:crypto";
 import * as acp from "@agentclientprotocol/sdk";
-import { log, sleep, UserError, CloudError, describeError, provenanceOf, loadSessionRecord, findSessionByCloudId, saveSessionRecord, hintKey, saveHint, loadHint } from "./util.mjs";
+import { log, sleep, UserError, CloudError, RecoveryNeeded, describeError, provenanceOf, loadSessionRecord, findSessionByCloudId, saveSessionRecord, sessionRecordOf, samePath, hintKey, saveHint, loadHint } from "./util.mjs";
 import { Turn } from "./turn.mjs";
 import { cleanPrompt, t3AttachmentDirs } from "./prompt.mjs";
 import { t3McpFrom } from "./t3mcp.mjs";
@@ -19,7 +19,7 @@ export const CANCEL_GRACE_MS = 1500;
 export const DRAIN_WAIT_MS = 60_000;
 
 // Fields of a session record that tie it to a cloud task (copied when a new session takes over a task).
-const CLOUD_FIELDS = ["cloudId", "createdIn", "turnId", "doneTurnId", "lastSeq", "title", "webUrl", "bundle", "outcomeBranch", "baseBranch", "baseSha", "appliedPatchFile", "sentMode", "sentModel", "prUrl"];
+const CLOUD_FIELDS = ["cloudId", "cloudState", "createdIn", "turnId", "doneTurnId", "lastSeq", "title", "webUrl", "bundle", "outcomeBranch", "baseBranch", "baseSha", "appliedPatchFile", "sentMode", "sentModel", "prUrl"];
 
 export class MeghaAgent {
   constructor(conn, backend, { version = "0.0.0", env = process.env, drainWaitMs = DRAIN_WAIT_MS } = {}) {
@@ -74,13 +74,21 @@ export class MeghaAgent {
   }
 
   // Resolve a session id that may be ours (persisted) or a cloud id picked from session/list.
+  // A session already bound in this process is reused only for the same folder. For another folder
+  // it is bound again from its saved fields, with every check a fresh bind gets (the local record,
+  // then the cloud's repo), and the old binding stays as it was unless all of them pass: a cached
+  // session must never carry repo A's task into repo B's folder.
   async #bind(sessionId, cwd, mcpServers) {
-    let s = this.sessions.get(sessionId);
-    if (s) return s;
-    const rec = loadSessionRecord(sessionId) ?? findSessionByCloudId(this.backend.name, sessionId);
+    const cached = this.sessions.get(sessionId);
+    if (cached && (!cwd || samePath(cwd, cached.cwd))) return cached;
+    if (cached && (cached.active || (cached.turn && !cached.turn.isSettled))) {
+      throw new UserError("This session still has a turn running in its current folder, so it can't be opened in another folder now. Try again once it has finished.");
+    }
+    if (cached) log("session reopened in another folder; checking it again");
+    const rec = cached ? sessionRecordOf(cached) : loadSessionRecord(sessionId) ?? findSessionByCloudId(this.backend.name, sessionId);
     // createdIn (where megha created the cloud task) comes only from the record, never from this
     // bind's cwd: rebinding a session must not become evidence that it belongs here.
-    s = rec ? { ...rec, id: sessionId, cwd: cwd || rec.cwd, createdIn: provenanceOf(rec), config: { ...(rec.config ?? {}) } }
+    const s = rec ? { ...rec, id: sessionId, cwd: cwd || rec.cwd, createdIn: provenanceOf(rec), config: { ...(rec.config ?? {}) } }
       : { id: sessionId, backend: this.backend.name, cwd, cloudId: sessionId, createdIn: null, config: {}, createdAt: new Date().toISOString() };
     // What the local record alone can refuse (a bundle session made in another folder) is refused
     // here, before a failing network check could let the session bind unchecked.
@@ -156,7 +164,9 @@ export class MeghaAgent {
     // have its cloud cancel in flight. Wait for it to settle; if it won't in time, refuse.
     const prev = s.turn;
     if (prev && !prev.isSettled) {
-      const drained = await Promise.race([prev.settled.then(() => true), sleep(this.drainWaitMs, turn.signal).then(() => false)]);
+      const giveUp = new AbortController(); // ends the losing wait, so its timer doesn't linger
+      const drained = await Promise.race([prev.settled.then(() => true), sleep(this.drainWaitMs, AbortSignal.any([turn.signal, giveUp.signal])).then(() => false)]);
+      giveUp.abort();
       if (!drained) {
         s.active = null;
         if (turn.stopped) return { stopReason: "cancelled" };
@@ -171,23 +181,31 @@ export class MeghaAgent {
       signal: turn.signal,
       update: send,
       text: (t) => send({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: t } }),
-      requestPermission: (p) => (turn.muted || !turn.live ? Promise.resolve({ outcome: { outcome: "cancelled" } }) : this.conn.requestPermission(p)),
+      requestPermission: (p) => (turn.muted || !turn.permissionsValid ? Promise.resolve({ outcome: { outcome: "cancelled" } }) : this.conn.requestPermission(p)),
     };
     const t0 = Date.now();
     const run = turn.run(async () => {
       if (turn.stopped) return "cancelled";
+      // A stopped turn left the checkout needing the user's attention, after T3 had its answer.
+      if (s.notice) { io.text(`${s.notice}\n\n`); s.notice = null; }
       if (input.command) { await this.backend.command(s, input.command, io); return "end_turn"; }
       if (!s.cloudId) this.#adoptFromHint(s, input, io);
       return this.backend.prompt(s, input, io);
     });
     const outcome = run.then((r) => ({ r }), (e) => ({ e }));
     const aborted = new Promise((resolve) => (turn.stopped ? resolve() : turn.signal.addEventListener("abort", resolve, { once: true })));
-    const first = await Promise.race([outcome, aborted.then(() => sleep(CANCEL_GRACE_MS)).then(() => null)]);
+    const graceOver = new AbortController(); // the run answered first: end the grace timer too
+    const first = await Promise.race([outcome, aborted.then(() => sleep(CANCEL_GRACE_MS, graceOver.signal)).then(() => null)]);
+    graceOver.abort();
 
     if (first === null) {
       // Cancelled and the backend is still winding the cloud turn down: answer T3 now, finish quietly.
       turn.muted = true;
-      turn.track(outcome.then((x) => { if (x.e) log(`cancelled turn ended with: ${describeError(x.e)}`); this.#rememberThread(s); }), "cancelled turn");
+      turn.track(outcome.then((x) => {
+        if (x.e) log(`cancelled turn ended with: ${describeError(x.e)}`);
+        if (x.e instanceof RecoveryNeeded) s.notice = x.e.message; // shown at the next prompt
+        this.#rememberThread(s);
+      }), "cancelled turn");
       s.active = null;
       log(`prompt cancelled; answered in ${((Date.now() - t0) / 1000).toFixed(1)} s, cloud turn settles in the background`);
       return { stopReason: "cancelled" };
@@ -195,7 +213,10 @@ export class MeghaAgent {
     s.active = null;
     this.#rememberThread(s);
     if (first.e) {
-      if (turn.stopped) return { stopReason: "cancelled" };
+      if (turn.stopped) {
+        if (first.e instanceof RecoveryNeeded) { log(describeError(first.e)); io.text(first.e.message); }
+        return { stopReason: "cancelled" };
+      }
       log(`prompt failed: ${describeError(first.e)}`);
       throw this.rpcError(first.e);
     }

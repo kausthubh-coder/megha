@@ -8,6 +8,11 @@
 //   - `live` is false once the turn was stopped or its prompt has finished. Check it right before any
 //     mutation a callback makes (a late permission answer must not reach the cloud).
 //   - `ended` resolves when the turn stops or finishes, so a callback can stop waiting on the client.
+//   - `permissionsValid` is false as soon as the cloud turn starts ending, for any cause: Stop, the
+//     backend's deadline, or a terminal result from the cloud (`closePermissions()`). An answer to a
+//     permission prompt is sent only while it is true. This is separate from cleanup: the turn may
+//     still be live (its final requests running) long after its prompts stopped being answerable.
+//     `permissionsClosed` resolves at that moment, so a prompt still open in the client is abandoned.
 //   - `track(promise)` registers work that may outlive the prompt's answer.
 //   - `settled` resolves once the prompt's own run and all tracked work are done. The next prompt in
 //     the session waits for it before it touches the session's cloud state.
@@ -21,6 +26,8 @@ export class Turn {
   #runDone = false;
   #onEnded;
   #onSettled;
+  #permissionsClosed = false;
+  #onPermissionsClosed;
   isSettled = false;
   muted = false; // T3 already has its answer: send it nothing more from this turn
 
@@ -29,8 +36,10 @@ export class Turn {
     this.signal = signal ? AbortSignal.any([this.#ac.signal, signal]) : this.#ac.signal;
     this.ended = new Promise((resolve) => { this.#onEnded = resolve; });
     this.settled = new Promise((resolve) => { this.#onSettled = resolve; });
-    if (this.signal.aborted) this.#onEnded();
-    else this.signal.addEventListener("abort", () => this.#onEnded(), { once: true });
+    this.permissionsClosed = new Promise((resolve) => { this.#onPermissionsClosed = resolve; });
+    const onStop = () => { this.closePermissions(); this.#onEnded(); };
+    if (this.signal.aborted) onStop();
+    else this.signal.addEventListener("abort", onStop, { once: true });
   }
 
   stop() { this.#ac.abort(); }
@@ -39,11 +48,20 @@ export class Turn {
   get live() { return !this.signal.aborted && !this.#finished; }
   assertLive() { if (!this.live) throw new Cancelled(); }
 
+  // The cloud turn is ending (megha is stopping it, or the cloud reported its end).
+  closePermissions() {
+    if (this.#permissionsClosed) return;
+    this.#permissionsClosed = true;
+    this.#onPermissionsClosed();
+  }
+  get permissionsValid() { return this.live && !this.#permissionsClosed; }
+
   // The prompt's own work. When it ends the turn is finished: its callbacks may no longer act.
   run(fn) {
     const p = Promise.resolve().then(fn);
     p.then(() => {}, () => {}).then(() => {
       this.#finished = true;
+      this.closePermissions();
       this.#onEnded();
       this.#runDone = true;
       this.#check();

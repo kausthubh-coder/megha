@@ -79,7 +79,7 @@ export async function run() {
     mockFetch(claudeBase([
       ["POST", /cse_r2c\/events$/, () => json({ results: [{ sequence_num: String(seq += 10) }] })],
       ["GET", /cse_r2c\/events\/stream$/, () => sse([crow(seq + 1, { type: "result", subtype, is_error: true, result: `${CANARY.serverBody} ${CANARY.envSecret}` })])],
-      ["GET", /cse_r2c$/, () => json({ session: { id: "cse_r2c" } })],
+      ["GET", /cse_r2c$/, () => json({ session: { id: "cse_r2c", worker_status: "idle" } })],
     ]));
     const a = new MeghaAgent(fakeConn(), new ClaudeBackend({ statusPollMs: 60_000 }), { env: {} });
     const { sessionId } = await a.newSession({ cwd: repo, mcpServers: [] });
@@ -221,7 +221,7 @@ export async function run() {
     const a = new MeghaAgent(fakeConn(), new ClaudeBackend({ statusPollMs: 60_000, turnTimeoutMs: 300, stopWaitMs: 300 }), { env: {}, drainWaitMs: 5000 });
     const { sessionId } = await a.newSession({ cwd: repo, mcpServers: [] });
     const s = a.sessions.get(sessionId);
-    Object.assign(s, { cloudId: "cse_r6", bundle: true, repoChecked: true, sentMode: s.config.mode, sentModel: s.config.model });
+    Object.assign(s, { cloudId: "cse_r6", bundle: true, repoChecked: true, cloudState: "idle", sentMode: s.config.mode, sentModel: s.config.model });
     const first = await hung(a.prompt({ sessionId, prompt: text("long") }));
     assert.notEqual(first, "hung");
     assert.match(first.e?.message ?? "", /timed out/);
@@ -229,7 +229,7 @@ export async function run() {
     const users = () => kinds.filter((k) => k === "user").length;
     const retry = await errOf(a.prompt({ sessionId, prompt: text("retry") }));
     assert.ok(retry, "the retry is refused while the timed-out turn may still run");
-    assert.match(retry.message, /hasn't confirmed it stopped/);
+    assert.match(retry.message, /still running; wait or use \/status/);
     assert.equal(users(), 1, "no new prompt sent over the timed-out turn");
     assert.ok(kinds.filter((k) => k === "interrupt").length >= 2, "asked the cloud to stop again");
     running = false;
@@ -257,7 +257,7 @@ export async function run() {
     assert.ok(cancels >= 1, "the deadline sent a cloud cancel");
     const retry = await errOf(a.prompt({ sessionId, prompt: text("retry") }));
     assert.ok(retry, "the retry is refused while the timed-out turn still runs");
-    assert.match(retry.message, /hasn't confirmed it stopped/);
+    assert.match(retry.message, /still running; wait or use \/status/);
     assert.equal(followUps, 1, "no follow-up over the running turn");
     assert.ok(cancels >= 2, "asked the cloud to cancel again");
     cur = { ...cur, status: "cancelled" };
@@ -285,9 +285,9 @@ export async function run() {
     await pushOutcomeBranch(work, "claude/fix-2", "two\n");
     const github = { sources: [{ type: "git_repository", url: "https://github.com/acme/imp2" }] };
     const calls = mockFetch(claudeBase([
-      ["GET", /cse_imp2$/, () => json({ session: { id: "cse_imp2", title: "Imported", status: "active",
+      ["GET", /cse_imp2$/, () => json({ session: { id: "cse_imp2", worker_status: "idle", title: "Imported", status: "active",
         config: { ...github, outcomes: [{ type: "git_repository", git_info: { type: "github", repo: "acme/imp2", branches: ["claude/fix-2"] } }] } } })],
-      ["GET", /cse_noout$/, () => json({ session: { id: "cse_noout", title: "No outcome", status: "active", config: github } })],
+      ["GET", /cse_noout$/, () => json({ session: { id: "cse_noout", worker_status: "idle", title: "No outcome", status: "active", config: github } })],
     ]));
     const conn = fakeConn();
     const a = new MeghaAgent(conn, new ClaudeBackend(), { env: {} });
@@ -433,7 +433,7 @@ export async function run() {
       mockFetch(claudeBase());
       const a = new MeghaAgent(fakeConn(), new ClaudeBackend({ statusPollMs: 60_000 }), { env: {}, drainWaitMs: 4000 });
       const { sessionId } = await a.newSession({ cwd: repo, mcpServers: [] });
-      Object.assign(a.sessions.get(sessionId), { cloudId: "cse_rc", bundle: false, outcomeBranch: "claude/rc", baseBranch: "main", repoChecked: true, webUrl: "https://claude.ai/code/cse_rc" });
+      Object.assign(a.sessions.get(sessionId), { cloudId: "cse_rc", bundle: false, outcomeBranch: "claude/rc", baseBranch: "main", repoChecked: true, cloudState: "idle", webUrl: "https://claude.ai/code/cse_rc" });
       const before = sockets.size;
       const p = a.prompt({ sessionId, prompt: text("/apply") });
       await until(() => sockets.size > before, 8000);

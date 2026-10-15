@@ -366,8 +366,8 @@ export async function run({ root }) {
     mockFetch(claudeBase([
       ["POST", new RegExp(`^${AN}/v1/code/sessions/cse_c5/events$`), () => json({ results: [{ sequence_num: "10" }] })],
       ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_c5/events/stream$`), () => sse([crow(11, { type: "result", subtype: "success", is_error: false })])],
-      ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_c5$`), () => (++gets === 1 ? json({ session: { id: "cse_c5", config: { sources: [{ type: "git_repository", url: "https://github.com/acme/can5" }] } } })
-        : gate.promise.then(() => json({ session: { id: "cse_c5", title: "t" } })))],
+      ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_c5$`), () => (++gets === 1 ? json({ session: { id: "cse_c5", worker_status: "idle", config: { sources: [{ type: "git_repository", url: "https://github.com/acme/can5" }] } } })
+        : gate.promise.then(() => json({ session: { id: "cse_c5", worker_status: "idle", title: "t" } })))],
     ]));
     const a = new MeghaAgent(fakeConn(), new ClaudeBackend({ statusPollMs: 60_000 }), { env: {} });
     const { sessionId } = await a.newSession({ cwd: work, mcpServers: [] });
@@ -394,7 +394,7 @@ export async function run({ root }) {
       ["POST", new RegExp(`^${AN}/v1/sessions$`), () => json({ id: "session_b1" })],
       ["POST", new RegExp(`^${AN}/v1/code/sessions/cse_b1/events$`), () => json({ results: [] })],
       ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_b1/events/stream$`), () => sse([crow(5, { type: "result", subtype: "success", is_error: false })])],
-      ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_b1$`), () => json({ session: { id: "cse_b1" } })],
+      ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_b1$`), () => json({ session: { id: "cse_b1", worker_status: "idle" } })],
     ]));
     const be = new ClaudeBackend();
     const s = { id: "mg_b1", cwd: repo, config: {} };
@@ -425,7 +425,7 @@ export async function run({ root }) {
       ["POST", new RegExp(`^${AN}/v1/sessions$`), (req) => json({ id: `session_${req.body.session_context.seed_bundle_file_id}` })],
       ["POST", new RegExp(`^${AN}/v1/code/sessions/cse_file_w\\d/events$`), () => json({ results: [] })],
       ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_file_w\\d/events/stream$`), () => sse([crow(5, { type: "result", subtype: "success", is_error: false })])],
-      ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_file_w\\d$`), () => json({ session: {} })],
+      ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_file_w\\d$`), () => json({ session: { worker_status: "idle" } })],
     ]));
     const run1 = async (cwd, id) => { const be = new ClaudeBackend(); const s = { id, cwd, config: {} }; await be.prepare(s); await be.prompt(s, cleanPrompt(text("go")), recorder().io); return s; };
     const [sa, sb] = await Promise.all([run1(repo, "mg_wa"), run1(wt, "mg_wb")]);
@@ -477,7 +477,7 @@ export async function run({ root }) {
     const be = new ClaudeBackend({ statusPollMs: 60_000, turnTimeoutMs: 400, stopWaitMs: 300 });
     const s = { id: "mg_f6b", cwd: repo, config: {} };
     await be.prepare(s);
-    Object.assign(s, { cloudId: "cse_f6b", bundle: true, repoChecked: true, sentMode: s.config.mode, sentModel: s.config.model });
+    Object.assign(s, { cloudId: "cse_f6b", bundle: true, repoChecked: true, cloudState: "idle", sentMode: s.config.mode, sentModel: s.config.model });
     const e = await errOf(Promise.race([be.prompt(s, cleanPrompt(text("hi")), recorder().io), wait(5000).then(() => "hung")]));
     assert.ok(e instanceof Error, `ended with an error, got ${e}`);
     assert.match(e.message, /timed out/);
@@ -603,7 +603,7 @@ export async function run({ root }) {
   await test("F10 claude: an imported GitHub session recovers its base and /apply applies its pushed branch", async () => {
     const { work } = await githubLikeRepo("acme/imp");
     await pushOutcomeBranch(work, "claude/fix-1", "two\n");
-    const imported = { id: "cse_imp", title: "Imported", status: "active", config: { sources: [{ type: "git_repository", url: "https://github.com/acme/imp" }],
+    const imported = { id: "cse_imp", title: "Imported", status: "active", worker_status: "idle", config: { sources: [{ type: "git_repository", url: "https://github.com/acme/imp" }],
       outcomes: [{ type: "git_repository", git_info: { type: "github", repo: "acme/imp", branches: ["claude/fix-1"] } }] } };
     mockFetch(claudeBase([
       ["GET", new RegExp(`^${AN}/v1/code/sessions/cse_imp$`), () => json({ session: imported })],

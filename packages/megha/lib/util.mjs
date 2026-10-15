@@ -5,7 +5,10 @@ import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve as resolvePath } from "node:path";
+
+// Same folder? Windows paths are case-insensitive.
+export const samePath = (a, b) => !!a && !!b && (process.platform === "win32" ? resolvePath(a).toLowerCase() === resolvePath(b).toLowerCase() : resolvePath(a) === resolvePath(b));
 
 let logPrefix = "megha";
 export const setLogPrefix = (p) => { logPrefix = p; };
@@ -14,13 +17,20 @@ export function log(...parts) {
   process.stderr.write(`[${logPrefix}] ${parts.map((p) => (typeof p === "string" ? p : String(p))).join(" ")}\n`);
 }
 
+// Resolves after ms, or at once when signal aborts. Either way nothing is left behind: the timer is
+// cleared on abort and the abort listener is removed when the timer fires (a long-lived signal would
+// otherwise collect one listener per sleep).
 export const sleep = (ms, signal) => new Promise((resolve) => {
   if (signal?.aborted) { resolve(); return; }
-  const t = setTimeout(resolve, ms);
-  signal?.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+  const onAbort = () => { clearTimeout(t); resolve(); };
+  const t = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolve(); }, ms);
+  signal?.addEventListener("abort", onAbort, { once: true });
 });
 
 export class UserError extends Error {}
+// Something the user must act on even when the turn was stopped (a local apply that left the checkout
+// changed): the agent shows it now, or at the start of the next prompt if T3 already has its answer.
+export class RecoveryNeeded extends UserError {}
 export class Cancelled extends Error { constructor() { super("cancelled"); this.name = "Cancelled"; } }
 
 // ---------- cloud API errors ----------
@@ -176,8 +186,56 @@ export function findSessionByCloudId(backend, cloudId) {
 export function allSessionRecords(backend) {
   return readAll(SESSIONS_DIR).filter((s) => s.backend === backend);
 }
-const PERSISTED_KEYS = ["id", "backend", "cwd", "cloudId", "turnId", "doneTurnId", "lastSeq", "title", "webUrl", "config", "bundle",
+const PERSISTED_KEYS = ["id", "backend", "cwd", "cloudId", "cloudState", "turnId", "doneTurnId", "lastSeq", "title", "webUrl", "config", "bundle",
   "outcomeBranch", "baseBranch", "baseSha", "appliedPatchFile", "sentMode", "sentModel", "prUrl", "createdAt", "updatedAt"];
+
+// ---------- the session's cloud turn state ----------
+// What megha knows about the cloud task's (Codex) or session's (Claude) current turn:
+//   idle            a terminal status was seen from the cloud (stream end event, or a GET)
+//   running         megha started a turn and has not seen it end
+//   stop_requested  megha asked the cloud to stop it (Stop, or the turn's time limit) and has not
+//                   seen it end; an accepted cancel request is not an ended turn
+//   unknown         megha can't tell: a turn-starting request whose answer never came (it may have
+//                   been taken), or a session megha never watched (bound from a cloud id, or a
+//                   record from before this field)
+// Only an observed terminal status moves it to idle. It is saved with the session record at every
+// change, so a restarted megha sees it. Every mutation (prompt, follow-up, apply, PR) checks the cloud
+// first unless the state is idle (each backend's #reconcile).
+export const CLOUD_STATES = ["idle", "running", "stop_requested", "unknown"];
+export function cloudStateOf(session) {
+  if (CLOUD_STATES.includes(session.cloudState)) return session.cloudState;
+  return session.cloudId ? "unknown" : "idle";
+}
+export function setCloudState(session, state) {
+  if (!CLOUD_STATES.includes(state)) throw new Error(`unknown cloud state ${state}`);
+  if (session.cloudState === state) return;
+  session.cloudState = state;
+  if (session.cloudId) {
+    try { saveSessionRecord(session); } catch (e) { log(`session save failed: ${describeError(e)}`); }
+  }
+}
+// The text a refused mutation shows.
+export const stillRunningText = (label, url, again) =>
+  `The previous ${label} turn is still running; wait or use /status.${again === undefined ? "" : ` megha ${again ? "asked" : "tried to ask"} ${label} to stop it again.`}${url ? ` Open it at ${url}.` : ""}`;
+// A turn-starting request failed: did the cloud surely not take it? Only an HTTP error answer (or a
+// refused login) says so; a timeout, a dropped connection or an unreadable answer may hide a turn
+// that started.
+export const surelyRejected = (e) => e instanceof UserError || (e instanceof CloudError && e.status >= 400 && e.status < 500);
+// Send a request that starts a cloud turn (create, follow-up, user event). While it is in flight the
+// state is "unknown", saved first, so even a crash mid-request leaves a record that is checked before
+// the next mutation. The cloud's answer makes it "running"; a sure refusal puts back what it was.
+export async function startCloudTurn(session, send) {
+  const before = cloudStateOf(session);
+  setCloudState(session, "unknown");
+  try {
+    const r = await send();
+    setCloudState(session, "running");
+    return r;
+  } catch (e) {
+    if (surelyRejected(e)) setCloudState(session, before);
+    throw e;
+  }
+}
 // Where megha created the session's cloud task: the folder of the session/new that sent its first
 // prompt. Set once, when megha creates the cloud task, and never rewritten. A bundle-seeded Claude
 // session names no repo in the cloud, so this is the only evidence of which checkout it belongs to;
@@ -188,10 +246,16 @@ export function provenanceOf(rec) {
   // A record from megha 0.1.0 has no createdIn: its cwd is the best evidence there is.
   return Object.hasOwn(rec, "createdIn") ? rec.createdIn ?? null : rec.cwd ?? null;
 }
-export function saveSessionRecord(session) {
+// The part of a live session that is saved: ids, settings and cloud state, none of the runtime state
+// (repo info, environment lists, the running turn, checks already passed).
+export function sessionRecordOf(session) {
   const rec = {};
-  for (const k of PERSISTED_KEYS) if (session[k] !== undefined) rec[k] = session[k];
+  for (const k of PERSISTED_KEYS) if (session[k] !== undefined) rec[k] = structuredClone(session[k]);
   rec.createdIn = session.createdIn ?? null;
+  return rec;
+}
+export function saveSessionRecord(session) {
+  const rec = sessionRecordOf(session);
   rec.updatedAt = new Date().toISOString();
   writeJsonAtomic(SESSIONS_DIR, fileFor(SESSIONS_DIR, session.id), rec);
   prune(SESSIONS_DIR, MAX_SESSIONS);
@@ -243,22 +307,29 @@ export async function cachedList(name, ttlMs, fetcher, fallback) {
 
 // ---------- git ----------
 // Every git call is bounded. `timeoutMs` ends one that stalls (a hung ls-remote, fetch or credential
-// helper) with { code: -1, timedOut: true }; `signal` (the turn's Stop) ends it at once with Cancelled.
-// Either way megha kills only the git process it spawned, and answers without waiting for the pipes to
-// close (a helper git started may still hold them). Pass a signal only to commands that are safe to
-// kill: reads, fetches, bundle creation. A command that changes the checkout or a ref gets none; check
-// the signal before starting it instead. git's stderr can quote the remote ("remote: ..." lines), so
-// it is returned to the caller but never put in an error message.
+// helper) with { code: -1, timedOut: true }; `signal` (the turn's Stop) ends it with Cancelled. Either
+// way megha ends git's whole process tree (git starts remote helpers such as git-remote-https, which
+// hold the connection; on Windows git.exe is itself a launcher for another git.exe), and the call
+// settles only once git has exited and its pipes have closed, so nothing it started outlives it (see
+// killTree). Pass a signal only to commands that are safe to kill: reads, fetches, bundle creation. A
+// command that changes the checkout or a ref gets none; check the signal before starting it instead,
+// and verify the result if its timeout fires (lib/diff.mjs). git's stderr can quote the remote
+// ("remote: ..." lines), so it is returned to the caller but never put in an error message.
 export const GIT_TIMEOUT_MS = 120_000;
 export const GIT_NETWORK_TIMEOUT_MS = 60_000;
+// How long a killed tree may take to exit before megha gives up waiting and says so.
+const TREE_EXIT_WAIT_MS = 10_000;
+const WINDOWS = process.platform === "win32";
 export function git(cwd, args, { input, allowFail = true, signal, timeoutMs = GIT_TIMEOUT_MS, network = false } = {}) {
   if (signal?.aborted) return Promise.reject(new Cancelled());
   return new Promise((resolve, reject) => {
     // A network call never waits on a terminal prompt nobody can see.
     const env = network ? { ...process.env, GIT_TERMINAL_PROMPT: "0" } : process.env;
-    const child = spawn("git", args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    // POSIX: git leads its own process group, so one kill reaches every process it started.
+    const child = spawn("git", args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, detached: !WINDOWS });
+    const closed = new Promise((r) => child.once("close", r));
     const out = []; const err = [];
-    let done = false;
+    let done = false, killing = false;
     const end = (fn) => {
       if (done) return;
       done = true;
@@ -266,10 +337,16 @@ export function git(cwd, args, { input, allowFail = true, signal, timeoutMs = GI
       signal?.removeEventListener("abort", onAbort);
       fn();
     };
-    const kill = () => { try { child.kill(); } catch {} child.stdout.destroy(); child.stderr.destroy(); };
-    const onAbort = () => end(() => { kill(); reject(new Cancelled()); });
-    const timer = setTimeout(() => end(() => {
-      kill();
+    // Stop or the timeout: end the tree, then answer once it is gone.
+    const killThen = (fn) => {
+      if (done || killing) return;
+      killing = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      killTree(child, closed, args[0]).then(() => end(fn));
+    };
+    const onAbort = () => killThen(() => reject(new Cancelled()));
+    const timer = setTimeout(() => killThen(() => {
       log(`git ${args[0]} gave no answer in ${Math.round(timeoutMs / 1000)} s; stopped it`);
       if (allowFail) resolve({ code: -1, stdout: "", stderr: "", timedOut: true });
       else reject(new Error(`git ${args[0]} timed out after ${Math.round(timeoutMs / 1000)} s`));
@@ -278,13 +355,43 @@ export function git(cwd, args, { input, allowFail = true, signal, timeoutMs = GI
     child.stdout.on("data", (d) => out.push(d));
     child.stderr.on("data", (d) => err.push(d));
     child.stdin.on("error", () => {}); // EPIPE when git exits (or is killed) before reading its input
-    child.on("error", (e) => end(() => (allowFail ? resolve({ code: -1, stdout: "", stderr: e.message }) : reject(e))));
-    child.on("close", (code) => end(() => {
+    child.on("error", (e) => { if (!killing) end(() => (allowFail ? resolve({ code: -1, stdout: "", stderr: e.message }) : reject(e))); });
+    child.on("close", (code) => { if (!killing) end(() => {
       const r = { code, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8") };
       if (code !== 0 && !allowFail) reject(new Error(`git ${args[0]} failed (exit ${code})`));
       else resolve(r);
-    }));
+    }); });
     if (input !== undefined) child.stdin.end(input); else child.stdin.end();
+  });
+}
+
+// End the process tree rooted at a git megha spawned, and resolve once git has exited and its pipes
+// have closed. The pipes are inherited by the processes git started, so "closed" means none of them
+// is still running with them. Only that pid's tree is touched:
+//   Windows: taskkill /T /F /PID walks the tree by parent pid, so it runs while git (the root) is
+//            still alive; killing git first would orphan its children out of reach.
+//   POSIX:   git was spawned detached (its own process group); kill(-pid) signals the whole group.
+// If the tree hasn't gone after TREE_EXIT_WAIT_MS, megha stops waiting and logs it.
+function killTree(child, closed, what) {
+  if (child.pid === undefined) return Promise.resolve();
+  let killer = Promise.resolve();
+  if (WINDOWS) {
+    killer = new Promise((done) => {
+      const tk = spawn("taskkill", ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore", windowsHide: true });
+      tk.once("error", () => { try { child.kill(); } catch {} done(); });
+      tk.once("exit", () => done());
+    });
+  } else {
+    try { process.kill(-child.pid, "SIGKILL"); } catch { try { child.kill("SIGKILL"); } catch {} }
+  }
+  let bound;
+  const gaveUp = new Promise((r) => { bound = setTimeout(() => r(true), TREE_EXIT_WAIT_MS); });
+  return Promise.all([killer, Promise.race([closed.then(() => false), gaveUp])]).then(([, late]) => {
+    clearTimeout(bound);
+    if (late) {
+      log(`git ${what} was stopped but its processes had not exited after ${TREE_EXIT_WAIT_MS / 1000} s`);
+      child.stdout.destroy(); child.stderr.destroy();
+    }
   });
 }
 
