@@ -24,7 +24,7 @@ Preconditions: doctor passes for the backend; krida exists.
 - **Option change.** Write a steps file: initialize, session/new, then `{"method":"session/set_config_option","params":{"sessionId":"$sessionId","configId":"mode","value":"plan"}}` and the same for `model` with a non-default id from the session/new list. Run with `--steps <file>`. Each response's `configOptions` shows the new `currentValue`.
 - **Nothing created.** After the drive, `node .agents/skills/verify-megha/scripts/acp-drive.mjs --backend <b>` again: `session/list` shows the same first entries as before (no new task titled after this run).
 - **Stdout.** `summary.json` has `"nonJsonStdoutLines": 0`.
-- Also: `bun run --filter megha smoke` asserts the same for both backends (it writes to the shared data dir).
+- Also: `bun run --filter t3-megha smoke` asserts the same for both backends (it writes to the shared data dir).
 
 ## Gotchas
 

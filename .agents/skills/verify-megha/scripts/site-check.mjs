@@ -85,7 +85,7 @@ if (drive) {
   const shown = await page.locator("#install-prompt").innerText();
   const norm = (s) => s.replace(/\r\n/g, "\n").trim();
   check("copy: clipboard equals the prompt on the page", norm(clip) === norm(shown), `clipboard ${clip.length} chars, shown ${shown.length}`);
-  check("copy: prompt installs from npm", clip.includes("npm install -g megha"));
+  check("copy: prompt installs from npm", clip.includes("npm install -g t3-megha"));
   await page.screenshot({ path: join(out, "copy-copied-1440-light.png") });
 
   // OS tabs in "Or set it up by hand": click switches the panel, arrow keys move selection and focus.

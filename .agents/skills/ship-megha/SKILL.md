@@ -17,7 +17,7 @@ megha ships from `main` on `kausthubh-coder/megha` (public) to these surfaces:
 
 `<main>` below is `C:\Users\kaust\OneDrive\Documents\dev\megha`.
 
-**First release.** If `git -C <main> remote get-url origin` fails, `npm view megha version` returns 404, or `vercel` isn't installed or linked, read [first-release.md](first-release.md) first: it lists the one-time steps only I can do, and what changes in the steps below.
+**First release.** If `git -C <main> remote get-url origin` fails, `npm view t3-megha version` returns 404, or `vercel` isn't installed or linked, read [first-release.md](first-release.md) first: it lists the one-time steps only I can do, and what changes in the steps below.
 
 **Rules.** Merging, `npm publish`, Vercel production deploys, the registry PR and launching T3 cloud threads each need my go in this conversation; "ship" covers merge plus the surfaces I named. Stop at the first failure. Never force-push, skip CI, or push to `main` directly. Write the rollback (end of this file) into your notes before step 2.
 
@@ -30,7 +30,7 @@ megha ships from `main` on `kausthubh-coder/megha` (public) to these surfaces:
 5. **Release only:** bump the version in this PR. Edit `"version"` in `packages/megha/package.json` with your edit tool (`npm version` here runs a full npm install of the workspace and writes a `package-lock.json`), then:
    ```
    bun install                       # updates the workspace version recorded in bun.lock
-   npm view megha version            # must be lower than the new version (404 before the first publish)
+   npm view t3-megha version            # must be lower than the new version (404 before the first publish)
    cd packages/megha && npm publish --dry-run   # name megha, the new version, 14 files: LICENSE, README.md, index.mjs, lib/*.mjs, package.json
    ```
    Commit `packages/megha/package.json` and `bun.lock` together, and nothing else from the bump (no `package-lock.json`).
@@ -54,7 +54,7 @@ Leave out `--delete-branch`: gh would try to check out `main` in this worktree, 
 
 ## 3. Release and deploy
 
-Package first: the site tells users `npm install -g megha`.
+Package first: the site tells users `npm install -g t3-megha`.
 
 1. **npm** (release only, on my go). Publish from the exact merge commit, not this branch's pre-squash HEAD:
    ```
@@ -78,7 +78,7 @@ Package first: the site tells users `npm install -g megha`.
 
 Read only.
 
-- npm: `npm view megha version` is the new version; `npx -y megha@<version> --version` prints it; `npx -y megha@<version> doctor` runs (it reads logins, prints no tokens).
+- npm: `npm view t3-megha version` is the new version; `npx -y t3-megha@<version> --version` prints it; `npx -y t3-megha@<version> doctor` runs (it reads logins, prints no tokens).
 - Site: `curl -s -o /dev/null -w "%{http_code}" <production url>` is 200, and `node .agents/skills/verify-megha/scripts/site-check.mjs <production url>` passes. Look at the screenshots of what changed.
 
 ## 5. Update the main checkout (my T3)
@@ -101,6 +101,6 @@ A few lines: the PR and merge commit; what went live where (npm version and tag,
 ## Rollback
 
 - **Code:** `git revert <sha>` on a new branch, PR, CI, merge; then pull the main checkout (step 5) so my T3 runs the revert.
-- **npm:** `npm dist-tag add megha@<previous> latest`, then publish a fixed patch. Don't unpublish.
+- **npm:** `npm dist-tag add t3-megha@<previous> latest`, then publish a fixed patch. Don't unpublish.
 - **Site:** `vercel rollback` (or promote the previous production deployment in the Vercel dashboard), then fix forward with a PR.
 - **Registry:** the listing follows npm's `latest`, so the npm dist-tag move covers it.

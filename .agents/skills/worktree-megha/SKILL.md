@@ -48,7 +48,7 @@ The site is the only thing that binds a port. Setup's port pick is not per-check
 
 There is no backend, database or env file to copy; the site is static and the agent talks to the clouds directly. What checkouts do share:
 
-- **megha's data dir** `%LOCALAPPDATA%\megha` (session map, thread hints, model caches). My live T3 cloud threads use it. Any agent you start by hand gets `MEGHA_DATA_DIR=<throwaway folder>`; `verify-megha`'s `acp-drive.mjs` does this for you. `bun run --filter megha smoke` does not, and adds a local session record there (harmless, but know it).
+- **megha's data dir** `%LOCALAPPDATA%\megha` (session map, thread hints, model caches). My live T3 cloud threads use it. Any agent you start by hand gets `MEGHA_DATA_DIR=<throwaway folder>`; `verify-megha`'s `acp-drive.mjs` does this for you. `bun run --filter t3-megha smoke` does not, and adds a local session record there (harmless, but know it).
 - **The CLI logins** `~/.codex/auth.json` and `~/.claude/.credentials.json`: read-only, always.
 - **The cloud accounts.** A prompt creates a real task in my Codex or Claude account and costs quota. Read-only checks are free; see `verify-megha`.
 

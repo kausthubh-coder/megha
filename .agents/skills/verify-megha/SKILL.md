@@ -48,7 +48,7 @@ node .agents/skills/verify-megha/scripts/acp-drive.mjs --backend claude --steps 
 - `--prompt` first sets apply=off and, on Codex, the `krida` environment and Ask mode. The script refuses `session/prompt` without `--allow-cloud-task` or outside krida, except a prompt that is exactly `/status` or `/open` (they only read the task): `--load <id> --steps .agents/skills/verify-megha/steps/load-status.json` replays a task and runs both, for free.
 - Ready/healthy: every step prints `ok` and the last line is `PASSED  evidence: <dir>`. Exit 1 on a failed step or any non-JSON line on stdout (stdout is the protocol; a stray log line breaks T3).
 - Steps files: a JSON array of `{method, params, notify, async, waitMs, timeoutMs, expectError}`; `"$sessionId"`, `"$cwd"` and `"$loadId"` (the `--load` value) are filled in. `async` sends without waiting, which is how to race a cancel or a steer against a running prompt. Examples are in the feature files.
-- Also available, unchanged: `bun run --filter megha smoke` (read-only, both backends, uses the shared data dir), `node packages/megha/test/e2e.mjs codex|claude` (ONE live turn, writes `test/e2e-<backend>.jsonl`), `node packages/megha/test/live-steer.mjs codex|claude` (one task, three turns: image + model, cancel, steer).
+- Also available, unchanged: `bun run --filter t3-megha smoke` (read-only, both backends, uses the shared data dir), `node packages/megha/test/e2e.mjs codex|claude` (ONE live turn, writes `test/e2e-<backend>.jsonl`), `node packages/megha/test/live-steer.mjs codex|claude` (one task, three turns: image + model, cancel, steer).
 
 ## The agent in real T3 Code
 

@@ -29,7 +29,7 @@ Each is a code change, shipped through a normal PR and an npm release before the
   "website": "<site url>",
   "license": "MIT",
   "license_url": "https://github.com/kausthubh-coder/megha/blob/main/LICENSE",
-  "distribution": { "npx": { "package": "megha@<npm version>", "args": ["--backend", "codex"] } }
+  "distribution": { "npx": { "package": "t3-megha@<npm version>", "args": ["--backend", "codex"] } }
 }
 ```
 
@@ -37,7 +37,7 @@ Each is a code change, shipped through a normal PR and an npm release before the
 
 ## Steps
 
-1. Blockers fixed and released to npm; `npx -y megha@<version> --backend codex` answers `initialize` with a non-empty `authMethods` (check with `verify-megha`'s acp-drive using `--agent` pointed at the npx-installed `index.mjs`, or a steps file).
+1. Blockers fixed and released to npm; `npx -y t3-megha@<version> --backend codex` answers `initialize` with a non-empty `authMethods` (check with `verify-megha`'s acp-drive using `--agent` pointed at the npx-installed `index.mjs`, or a steps file).
 2. Fork the registry, add the folder(s), run its validation locally: `uv run --with jsonschema .github/workflows/build_registry.py` and `python3 .github/workflows/verify_agents.py --auth-check --agent megha-codex`.
 3. Open the PR (with my go), watch its CI, answer review.
 4. After merge: in T3, Settings, Providers, Add provider, ACP Registry, megha shows with its icon.
