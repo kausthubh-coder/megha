@@ -32,7 +32,7 @@ site, bun for development.
 
 - Install: `bun install`
 - Setup a fresh worktree: `bun run setup`
-- Doctor: `bun run doctor` (checks deps, both CLI logins, port)
+- Doctor: `bun run doctor` (checks deps, both CLI logins, browser, port)
 - Site dev: `bun run dev` (port from `PORT`; ready when Next prints `Ready`)
 - Agent tests (offline): `bun run test`
 - Agent smoke against live clouds (read-only, creates nothing): `bun run --filter t3-megha smoke`
@@ -50,6 +50,15 @@ site, bun for development.
 - Done means you saw it work. For the agent: run it the way T3 does (`node packages/megha/index.mjs --backend codex|claude`, cwd = a real GitHub repo) and read the session/update stream. For the site: open it in a browser.
 - Live cloud tasks cost the user's quota. Use read-only smoke tests by default; create a cloud task only when the change needs one, with a read-only prompt.
 - A skipped check is not a pass. Report what you ran, what you saw, and what you did not check.
+
+## Cloud sessions
+
+A cloud VM (Claude Code on the web, Codex Cloud) is Linux with a bare clone. The SessionStart hook in `.claude/settings.json` runs `node scripts/cloud.mjs` (Codex: set the environment's setup script to `CLOUD=1 node scripts/cloud.mjs`). It loads Kausthubh's global skills and rules, installs bun if missing, runs setup and the doctor, and makes sure a browser exists. It does nothing outside the cloud. Its last line says ready or what failed; rerun it if you're unsure.
+
+- Works here: `bun run setup`, `bun run doctor` (both logins read "none, as expected in a cloud session"), `bun run test`, `bun run check`, the site headless (`verify-megha`, "The site", Linux launch) on the VM's Playwright Chromium (`scripts/browser.mjs` picks Google Chrome when it's installed), and shipping with `ship-megha` up to the merge and the Vercel deploy.
+- `gh pr` doesn't work here; `gh api` does. `ship-megha` gives both.
+- Only on Kausthubh's machine: anything that needs the codex or claude login (`bun run --filter t3-megha smoke`, `test/e2e.mjs`, `test/live-steer.mjs`, `acp-drive.mjs` past `initialize`: here `--cwd .` gets `initialize` ok, then session/new fails with "Authentication required", as it should), real T3 threads, the main checkout (`ship-megha` step 5), `npm publish` (browser 2FA), and the Windows worktree removal. List those in the report.
+- Env vars: none. Never copy the CLI logins into a cloud environment.
 
 ## Working with me
 
@@ -72,6 +81,6 @@ site, bun for development.
 ## Safety
 
 - Never touch the user's CLI credentials (`~/.codex/auth.json`, `~/.claude/.credentials.json`) except to read the access token.
-- Production needs my explicit go: npm publish, Vercel production deploys, ACP Registry submissions.
+- Production needs my explicit go. "Ship" is the go to merge, which deploys the site on Vercel. npm publish and ACP Registry submissions each need their own go, by name.
 - No secrets in code, logs, screenshots or commits.
-- Git: public repo. Open a PR and wait for CI and my review.
+- Git: public repo. Open a PR and wait for CI; merge on my review or my "ship".

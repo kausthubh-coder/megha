@@ -19,7 +19,13 @@ megha ships from `main` on `kausthubh-coder/megha` (public) to these surfaces:
 
 **First release.** If `git -C <main> remote get-url origin` fails, `npm view t3-megha version` returns 404, or `vercel` isn't installed or linked, read [first-release.md](first-release.md) first: it lists the one-time steps only I can do, and what changes in the steps below.
 
-**Rules.** Merging, `npm publish`, Vercel production deploys, the registry PR and launching T3 cloud threads each need my go in this conversation; "ship" covers merge plus the surfaces I named. Stop at the first failure. Never force-push, skip CI, or push to `main` directly. Write the rollback (end of this file) into your notes before step 2.
+**Rules.**
+- Production needs my go in this conversation. "Ship" (or deploy, release) is that go for every step below that I named, including the merge, the Vercel deploy it triggers, the main checkout pull and cleanup: don't stop to ask between steps.
+- `npm publish` and the ACP Registry PR are the exceptions: each needs its own go, by name ("publish", "release to npm", "submit to the registry"). "Ship" alone never covers them. Launching T3 cloud threads also needs my go (it costs quota).
+- When a step fails because of this change (a failing check, a CI job, a build or deploy error), fix it, rerun the checks and carry on. Stop and tell me only when the cause is outside the change or the fix needs my decision.
+- Never end the turn while a CI run, build or deploy you started is queued or running. Watch it to the end.
+- Never force-push, skip or disable checks, raise a warning cap to get through, or push to `main` directly.
+- Write the rollback (end of this file) into your notes before step 2.
 
 ## 1. Ready
 
@@ -40,10 +46,10 @@ megha ships from `main` on `kausthubh-coder/megha` (public) to these surfaces:
 ```
 git push -u origin <branch>
 gh pr create --fill --base main
-gh pr checks <pr> --watch --fail-fast       # three CI jobs (plus a Vercel preview if connected); give up after 20 minutes
+gh pr checks <pr> --watch --fail-fast       # three CI jobs plus the Vercel preview; give up after 20 minutes
 ```
 
-Report the PR and stop for my review. On my go:
+A red check caused by this change: fix it on the branch, rerun `bun run check`, push, watch again. When all checks are green and I said ship, merge:
 
 ```
 gh pr merge <pr> --squash
@@ -51,6 +57,18 @@ gh pr view <pr> --json mergeCommit -q .mergeCommit.oid      # <sha>, used below
 ```
 
 Leave out `--delete-branch`: gh would try to check out `main` in this worktree, which the main checkout holds. Step 6 deletes the branch.
+
+**From a cloud session** (`## Cloud sessions` in AGENTS.md) `gh pr` doesn't work; `gh api` does. Run these outside the checkout (`cd /tmp`) so gh doesn't read the repo's remotes:
+
+```
+gh api repos/kausthubh-coder/megha/pulls -f head=<branch> -f base=main -f title="<title>" -F body=@<body.md> --jq .number   # <pr>
+gh api repos/kausthubh-coder/megha/commits/<head sha>/check-runs --jq '.check_runs[] | [.name,.status,.conclusion] | @tsv'
+                                            # poll every 30 s until all three "check (<os>)" runs are completed; all success
+gh api repos/kausthubh-coder/megha/commits/<head sha>/status --jq '.statuses[] | [.context,.state] | @tsv'   # Vercel preview
+gh api -X PUT repos/kausthubh-coder/megha/pulls/<pr>/merge -f merge_method=squash --jq .sha                  # <sha>
+```
+
+A failed job's log: `gh api repos/kausthubh-coder/megha/actions/runs/<run id>/jobs --jq '.jobs[] | [.name,.conclusion,.id] | @tsv'`, then `gh api repos/kausthubh-coder/megha/actions/jobs/<job id>/logs`. Re-running a job is refused from the cloud (403 from `gh api` and the GitHub MCP tools), so a failure outside this change (seen 2026-10-15: `next build` on ubuntu failing with "next/font/google queries have exactly one entry" while Google Fonts misbehaved, main and a local cold build green) needs a new real commit or my re-run. Never an empty commit.
 
 ## 3. Release and deploy
 
@@ -69,8 +87,8 @@ Package first: the site tells users `npm install -g t3-megha`.
    git push origin v<version>
    gh release create v<version> --generate-notes --verify-tag
    ```
-2. **Site** (when `apps/site` changed, on my go).
-   - Git integration connected: the merge already deployed it. Watch at most 10 minutes: `gh api repos/kausthubh-coder/megha/commits/<sha>/status -q '.statuses[] | select(.context | test("Vercel")) | .state'`. Done at `success`; stop at `failure` or `error`.
+2. **Site.** Vercel's Git integration is connected (2026-10-15): every merge to `main` deploys production, whatever it changed, so watch it on every ship.
+   - Git integration connected: the merge already started the deploy. Poll every 30 s, at most 10 minutes: `gh api repos/kausthubh-coder/megha/commits/<sha>/status -q '.statuses[] | select(.context | test("Vercel")) | .state'`. Done at `success`; stop at `failure` or `error`.
    - Not connected: from the repo root at `<sha>` (step 3.1's detached checkout, or `git checkout --detach origin/main`), `vercel deploy --prod`. It prints the deployment URL and waits for the build; done when it prints the production URL. `vercel inspect <url>` shows the state if the wait was cut off.
 3. **ACP Registry**: never part of a normal ship. Follow [registry.md](registry.md) when I ask for it.
 
@@ -83,6 +101,8 @@ Read only.
 
 ## 5. Update the main checkout (my T3)
 
+From a cloud session the main checkout isn't reachable: skip this step and list it in the report.
+
 Pulling is a deploy: every new T3 thread on Codex Cloud or Claude Cloud runs the pulled code. Threads already open keep their old process until restarted.
 
 - If `git -C <main> status --short` prints nothing and `git -C <main> branch --show-current` is `main`: `git -C <main> pull --ff-only`, then `bun install --frozen-lockfile` in `<main>`.
@@ -91,7 +111,7 @@ Pulling is a deploy: every new T3 thread on Codex Cloud or Claude Cloud runs the
 
 ## 6. Clean up
 
-- `git push origin --delete <branch>`, then `git -C <main> branch -D <branch>` (possible once this worktree is detached from it).
+- `git push origin --delete <branch>`, then `git -C <main> branch -D <branch>` (possible once this worktree is detached from it). From a cloud session: `git push origin --delete <branch>` only; the VM is thrown away with its clone.
 - This thread can't remove its own worktree: list it for removal (`worktree-megha`, "Remove a worktree"). Remove other finished worktrees only if no live thread uses them (`t3_thread_list`).
 
 ## 7. Report

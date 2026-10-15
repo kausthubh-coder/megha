@@ -81,7 +81,13 @@ $p = Start-Process cmd.exe -ArgumentList '/c', "set PORT=<n>&& bun run dev > `"$
 $p.Id                             # keep this PID for cleanup
 ```
 
-Ready when the log prints `Ready in` (about 15 s cold, 3 s warm). Healthy: `curl -s http://localhost:<n>/ | grep -o "Run T3 Code threads"` prints the phrase. `next dev` reads `PORT` only from the process environment, never from `.env` files.
+On Linux or macOS (a cloud session), start it in its own process group so stopping the group stops Next too:
+
+```
+PORT=<n> setsid bash -c 'echo $$ > /tmp/megha-site-<n>.pgid; exec bun run dev' > /tmp/megha-site-<n>.log 2>&1 < /dev/null &
+```
+
+Ready when the log prints `Ready in` (about 15 s cold, 3 s warm; under 1 s on a cloud VM). Healthy: `curl -s http://localhost:<n>/ | grep -o "Run T3 Code threads"` prints the phrase. `next dev` reads `PORT` only from the process environment, never from `.env` files.
 
 Then:
 
@@ -89,7 +95,7 @@ Then:
 node .agents/skills/verify-megha/scripts/site-check.mjs http://localhost:<n>/
 ```
 
-It loads the page in Chrome at 390x844 and 1440x900 in light and dark and checks status, headline, that the color scheme applied, no horizontal scroll, the hero copy button, and no console or page errors. Then it drives the install section: copies the prompt and compares the clipboard with the text on the page, and switches the OS tabs by click and arrow key. `--no-drive` skips the interactions. It writes a full-page screenshot and an ARIA snapshot per size and scheme.
+It loads the page in Chrome (on a cloud VM, Playwright's Chromium; `scripts/browser.mjs` picks) at 390x844 and 1440x900 in light and dark and checks status, headline, that the color scheme applied, no horizontal scroll, the hero copy button, and no console or page errors. Then it drives the install section: copies the prompt and compares the clipboard with the text on the page, and switches the OS tabs by click and arrow key. `--no-drive` skips the interactions. It writes a full-page screenshot and an ARIA snapshot per size and scheme.
 
 **Look at the screenshots** for the screens you changed, all four. The checks catch breakage; they don't catch a layout that is wrong but valid. The dark "N" button bottom-left is Next's dev indicator, not the site.
 
@@ -112,7 +118,7 @@ Proof standards:
 
 ## Cleanup
 
-- Site: `taskkill /T /F /PID <the PID you saved>`. Then `curl` the port and expect `000`. Kill only PIDs you started; other worktrees serve on neighboring ports.
+- Site: `taskkill /T /F /PID <the PID you saved>` on Windows; `kill -- -$(cat /tmp/megha-site-<n>.pgid)` on Linux or macOS. Then `curl` the port and expect `000`. Kill only PIDs you started; other worktrees serve on neighboring ports.
 - ACP drives exit by themselves. Their throwaway data dir sits inside the evidence folder; leave it.
 - T3 threads you launched stay as evidence; list them in your report. Cloud tasks and sessions can't be deleted from here and stay in my Codex and Claude history, so keep the count low.
 - Removing a temporary `meghaDev*` provider: restore from your `settings.json` backup or delete just that entry.

@@ -10,11 +10,11 @@ description: Make a megha checkout ready to work in, isolated from other checkou
 From the checkout root:
 
 ```
-bun run setup     # bun install --frozen-lockfile, then prints a free PORT
-bun run doctor    # read-only: node, git, deps vs bun.lock, codex + claude logins, gh auth, PORT, commits behind origin/main
+bun run setup     # bun install --frozen-lockfile, links .claude/skills -> .agents/skills, prints a free PORT
+bun run doctor    # read-only: node, git, deps vs bun.lock, codex + claude logins, gh auth, browser, PORT, commits behind origin/main
 ```
 
-Setup takes about 15 s in a fresh worktree (712 packages) and about 1 s when nothing changed. A healthy doctor is eight `ok` lines and exit 0:
+Setup takes about 15 s in a fresh worktree (712 packages) and about 1 s when nothing changed. A healthy doctor is nine `ok` lines and exit 0 (in a cloud session the two login lines read "none, as expected in a cloud session"):
 
 ```
 ok    node          24.19.0
@@ -23,17 +23,12 @@ ok    deps          14 direct dependencies match bun.lock
 ok    codex login   ChatGPT sign-in found, token valid for 5 days
 ok    claude login  claude.ai login found, token valid for 1 h
 ok    gh auth       signed in to github.com
+ok    browser       Google Chrome for verify-megha's site-check
 ok    port          PORT 3000 is free
 ok    origin/main   up to date
 ```
 
 A FAIL prints its fix. Login FAILs: tell me to run `codex login status` or `claude auth status`; never refresh the tokens yourself (the refresh token rotates and logs the CLI out).
-
-Then link the skills, which setup doesn't do yet (`.claude/skills` is not in git, so new worktrees lack it):
-
-```
-cmd /c mklink /J .claude\skills .agents\skills
-```
 
 ## Port: pick it yourself
 
@@ -65,7 +60,6 @@ git -C C:\Users\kaust\OneDrive\Documents\dev\megha fetch origin
 git -C C:\Users\kaust\OneDrive\Documents\dev\megha worktree add C:\Users\kaust\.t3\worktrees\megha\<name> -b <name> origin/main
 cd C:\Users\kaust\.t3\worktrees\megha\<name>
 bun run setup
-cmd /c mklink /J .claude\skills .agents\skills
 ```
 
 Until the GitHub remote exists, use `main` instead of `origin/main` and skip the fetch. Give the helper the path and the port you picked for it.
