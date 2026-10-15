@@ -68,7 +68,7 @@ gh api repos/kausthubh-coder/megha/commits/<head sha>/status --jq '.statuses[] |
 gh api -X PUT repos/kausthubh-coder/megha/pulls/<pr>/merge -f merge_method=squash --jq .sha                  # <sha>
 ```
 
-A failed job's log: `gh api repos/kausthubh-coder/megha/actions/runs/<run id>/jobs --jq '.jobs[] | [.name,.conclusion,.id] | @tsv'`, then `gh api repos/kausthubh-coder/megha/actions/jobs/<job id>/logs`.
+A failed job's log: `gh api repos/kausthubh-coder/megha/actions/runs/<run id>/jobs --jq '.jobs[] | [.name,.conclusion,.id] | @tsv'`, then `gh api repos/kausthubh-coder/megha/actions/jobs/<job id>/logs`. Re-running a job is refused from the cloud (403 from `gh api` and the GitHub MCP tools), so a failure outside this change (seen 2026-10-15: `next build` on ubuntu failing with "next/font/google queries have exactly one entry" while Google Fonts misbehaved, main and a local cold build green) needs a new real commit or my re-run. Never an empty commit.
 
 ## 3. Release and deploy
 
