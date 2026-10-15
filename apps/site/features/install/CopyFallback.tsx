@@ -4,8 +4,7 @@ import { useEffect, useRef, useSyncExternalStore } from "react";
 import { detectOs } from "./install";
 
 // When the clipboard API is blocked, the copy button hands over to the block it copies from: that
-// block shows how to copy by hand, right above the text, selects the text and takes focus. The hero's
-// button copies a prompt far down the page, so the instructions can't live next to the button.
+// block shows how to copy by hand, right above the text, selects the text and takes focus.
 
 type Fallback = { id: string; phase: "blocked" | "copied" } | null;
 
