@@ -195,31 +195,63 @@ const PERSISTED_KEYS = ["id", "backend", "cwd", "cloudId", "cloudState", "turnId
 // even if megha restarts before the next prompt. So such messages are notices: saved with the session
 // record first, then shown by the agent (lib/agent.mjs) at once if the turn can still talk, otherwise
 // at the start of the session's next prompt, and removed only once the client has it.
+//
+// A notice is { id, text }. The id is how a replacement session that adopts the old one's notices
+// (agent.mjs #adoptFromHint) and the old session agree on who owns which: shown exactly once while
+// megha keeps running, at least once if it dies mid-write.
 export function addNotice(session, text) {
-  session.notices = [...(session.notices ?? []), String(text)];
+  session.notices = [...sessionNotices(session), { id: crypto.randomUUID(), text: String(text) }];
   try { saveSessionRecord(session); } catch (e) { log(`session save failed: ${describeError(e)}`); }
 }
-// Send each of the session's notices with `write(text)` (a promise that resolves once the client has
-// the notification), in order, and remove each from the session (and its record) only when its write
-// succeeded. A rejected write (a closed ACP connection) keeps it for the next prompt. Writes start
-// synchronously, so a notice keeps its place among the turn's other output; a notice already being
-// written (session.noticesSending, not persisted) isn't sent again by an overlapping call. Resolves
-// once this call's writes have settled; never rejects.
+// The session's saved notices. A record from before ids holds plain strings: they get one here.
+export function sessionNotices(session) {
+  const list = session.notices ?? [];
+  if (list.some((n) => typeof n === "string")) session.notices = list.map((n) => (typeof n === "string" ? { id: crypto.randomUUID(), text: n } : n));
+  return session.notices ?? [];
+}
+// Ids of the session's notices whose write is pending right now (in memory only, never saved).
+export const noticesInFlight = (session) => (session.noticesInFlight ??= new Set());
+
+// Send the session's notices with `write(text)` (a promise that resolves once the client has the
+// notification). Each session has one delivery queue (session.noticeQueue, a promise chain, not
+// saved): this call's delivery runs after every earlier one, so notices go out one at a time, in
+// order, and none is written twice. When the queue is idle the first write starts synchronously, so a
+// notice keeps its place among the turn's other output. A notice is in flight while its write is
+// pending and removed (from the session and its record) only once the write resolved; a rejected
+// write (a closed ACP connection) leaves it saved, not in flight, for the next prompt. Returns the
+// queue's new tail, which never rejects; nobody has to wait on it (see noticesDelivered).
 export function deliverNotices(session, write) {
-  const sending = (session.noticesSending ??= new Set());
-  const writes = [];
-  for (const n of session.notices ?? []) {
-    if (sending.has(n)) continue;
-    sending.add(n);
-    let p;
-    try { p = Promise.resolve(write(n)); } catch (e) { p = Promise.reject(e); }
-    writes.push(p.then(() => {
-      const i = (session.notices ?? []).indexOf(n);
-      if (i >= 0) session.notices = session.notices.toSpliced(i, 1);
-      try { saveSessionRecord(session); } catch (e) { log(`session save failed: ${describeError(e)}`); }
-    }, (e) => log(`notice not delivered, kept for the next prompt: ${describeError(e)}`)).finally(() => sending.delete(n)));
+  const prev = session.noticeQueue;
+  const tail = (prev ? prev.then(() => drainNotices(session, write)) : drainNotices(session, write))
+    .finally(() => { if (session.noticeQueue === tail) session.noticeQueue = null; });
+  session.noticeQueue = tail;
+  return tail;
+}
+async function drainNotices(session, write) {
+  const inFlight = noticesInFlight(session);
+  for (;;) {
+    // Read again each time: a notice may have been added meanwhile, or adopted by another session.
+    const n = sessionNotices(session).find((x) => !inFlight.has(x.id));
+    if (!n) return;
+    inFlight.add(n.id);
+    try { await write(n.text); } catch (e) {
+      log(`notice not delivered, kept for the next prompt: ${describeError(e)}`);
+      return; // the later ones wait too, so they never overtake it
+    } finally { inFlight.delete(n.id); }
+    session.notices = sessionNotices(session).filter((x) => x.id !== n.id);
+    try { saveSessionRecord(session); } catch (e) { log(`session save failed: ${describeError(e)}`); }
   }
-  return Promise.all(writes);
+}
+// Wait for the session's notice queue, at most `ms` (or until `signal` aborts). True when it drained.
+// A prompt waits here before its cloud work; when the wait runs out the prompt goes on and the notice
+// stays saved: never lost, maybe late. Notice writes are never part of a turn's settlement.
+export async function noticesDelivered(session, ms, signal) {
+  const queue = session.noticeQueue;
+  if (!queue) return true;
+  const giveUp = new AbortController(); // ends the losing timer
+  const done = await Promise.race([queue.then(() => true), sleep(ms, signal ? AbortSignal.any([signal, giveUp.signal]) : giveUp.signal).then(() => false)]);
+  giveUp.abort();
+  return done;
 }
 
 // ---------- the session's cloud turn state ----------

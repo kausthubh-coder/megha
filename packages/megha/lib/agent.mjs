@@ -3,7 +3,7 @@
 
 import crypto from "node:crypto";
 import * as acp from "@agentclientprotocol/sdk";
-import { log, sleep, UserError, CloudError, RecoveryNeeded, describeError, provenanceOf, loadSessionRecord, findSessionByCloudId, saveSessionRecord, sessionRecordOf, samePath, hintKey, saveHint, loadHint, addNotice, deliverNotices } from "./util.mjs";
+import { log, sleep, UserError, CloudError, RecoveryNeeded, describeError, provenanceOf, loadSessionRecord, findSessionByCloudId, saveSessionRecord, sessionRecordOf, samePath, hintKey, saveHint, loadHint, addNotice, deliverNotices, noticesDelivered, sessionNotices, noticesInFlight } from "./util.mjs";
 import { Turn } from "./turn.mjs";
 import { cleanPrompt, t3AttachmentDirs } from "./prompt.mjs";
 import { t3McpFrom } from "./t3mcp.mjs";
@@ -17,17 +17,22 @@ export const CANCEL_GRACE_MS = 1500;
 // than raced against the old turn's session state. Longer than a backend's stop wait (30 s) and the
 // request bound (30 s), so a turn that settles on its own is always waited for.
 export const DRAIN_WAIT_MS = 60_000;
+// A prompt waits this long for notices still being written (the session's delivery queue, lib/util.mjs
+// deliverNotices) before its cloud work, so a warning reaches the user before the next follow-up. A
+// write that takes longer doesn't hold the prompt: the notice stays saved and goes out later.
+export const NOTICE_WAIT_MS = 5000;
 
 // Fields of a session record that tie it to a cloud task (copied when a new session takes over a task).
 const CLOUD_FIELDS = ["cloudId", "cloudState", "createdIn", "turnId", "doneTurnId", "lastSeq", "title", "webUrl", "bundle", "outcomeBranch", "baseBranch", "baseSha", "appliedPatchFile", "sentMode", "sentModel", "prUrl"];
 
 export class MeghaAgent {
-  constructor(conn, backend, { version = "0.0.0", env = process.env, drainWaitMs = DRAIN_WAIT_MS } = {}) {
+  constructor(conn, backend, { version = "0.0.0", env = process.env, drainWaitMs = DRAIN_WAIT_MS, noticeWaitMs = NOTICE_WAIT_MS } = {}) {
     this.conn = conn;
     this.backend = backend;
     this.version = version;
     this.env = env;
     this.drainWaitMs = drainWaitMs;
+    this.noticeWaitMs = noticeWaitMs;
     this.sessions = new Map(); // sessionId -> session
   }
 
@@ -184,7 +189,7 @@ export class MeghaAgent {
       text: say,
       // Something about the user's checkout they must see (lib/util.mjs addNotice): saved first, then
       // shown now while this turn can still talk to T3; once it is muted, at the next prompt. It stays
-      // saved until its notification is written.
+      // saved until its notification is written. The write is not the turn's work: Stop never waits on it.
       notice: (t) => {
         addNotice(s, t);
         if (!turn.muted) deliverNotices(s, (n) => this.#write(s.id, `\n\n${n}`));
@@ -195,10 +200,13 @@ export class MeghaAgent {
     const run = turn.run(async () => {
       if (turn.stopped) return "cancelled";
       // A replacement session for this thread takes over its cloud task, and the notices that came with it.
-      const adopted = !input.command && !s.cloudId ? this.#adoptFromHint(s, input) : null;
+      const adopted = !input.command && !s.cloudId ? await this.#adoptFromHint(s, input, turn.signal) : null;
       // Notices a stopped turn (or a megha that has since restarted, or the session this one replaced)
-      // could not show: first thing now, before any cloud or checkout work.
-      await deliverNotices(s, (n) => this.#write(s.id, `${n}\n\n`));
+      // could not show, and any still being written: first thing now, before any cloud or checkout
+      // work. The wait is bounded and ends on Stop; past it the notice stays saved for later.
+      deliverNotices(s, (n) => this.#write(s.id, `${n}\n\n`));
+      if (!(await noticesDelivered(s, this.noticeWaitMs, turn.signal)) && !turn.stopped) log("a notice is still being written; going on without it (it stays saved)");
+      if (turn.stopped) return "cancelled";
       if (adopted) io.text(adopted);
       if (input.command) { await this.backend.command(s, input.command, io); return "end_turn"; }
       return this.backend.prompt(s, input, io);
@@ -246,21 +254,29 @@ export class MeghaAgent {
   // using it; otherwise the handoff travels as context to a new task. Either way, say which: returns
   // the text to show (null without a handoff). Adopting moves the old session's unshown notices here
   // too: the thread hint will point at this session, so nothing would ever show them otherwise.
-  #adoptFromHint(s, input) {
+  async #adoptFromHint(s, input, signal) {
     if (!input.handoff) return null;
     const hint = s.t3Key ? loadHint(s.t3Key) : null;
     const rec = hint && hint.backend === this.backend.name && hint.sessionId !== s.id ? loadSessionRecord(hint.sessionId) : null;
     if (!rec?.cloudId) return "Starting a new cloud task. The earlier conversation from this thread is sent along as context.\n\n";
     for (const k of CLOUD_FIELDS) if (rec[k] !== undefined) s[k] = rec[k];
     // The old session may still be open in this process: take the notices from that copy, the one
-    // that would otherwise save them again.
-    const old = this.sessions.get(hint.sessionId) ?? rec;
-    if (old.notices?.length) {
-      s.notices = [...old.notices, ...(s.notices ?? [])];
+    // that would otherwise save them again. One it is writing right now stays its own (taking it too
+    // would show it on both sessions): give those writes the same bounded wait a prompt gives its own,
+    // then take only what isn't in flight. The old session drops what was taken, by id.
+    const open = this.sessions.get(hint.sessionId);
+    if (open) await noticesDelivered(open, this.noticeWaitMs, signal);
+    const old = open ?? rec;
+    const inFlight = open ? noticesInFlight(open) : new Set();
+    const taken = sessionNotices(old).filter((n) => !inFlight.has(n.id));
+    if (taken.length) {
+      s.notices = [...taken, ...sessionNotices(s)];
       saveSessionRecord(s); // saved here before they leave the old record: a crash duplicates, never loses
-      old.notices = [];
+      const ids = new Set(taken.map((n) => n.id));
+      old.notices = sessionNotices(old).filter((n) => !ids.has(n.id));
       try { saveSessionRecord(old); } catch (e) { log(`session save failed: ${describeError(e)}`); }
     }
+    if (inFlight.size) log("the replaced session is still writing a notice; it stays with that session");
     input.text = `T3 Code started a new session for this conversation (for example after a rollback). The history below is the current state; where it differs from what you remember, follow it.\n\n${input.text}`;
     log(`adopted cloud task ${rec.cloudId} from session ${hint.sessionId}`);
     return `Continuing the same cloud task${rec.webUrl ? ` ([open](${rec.webUrl}))` : ""}; T3 started a new session for this thread, so the earlier conversation is sent along as the current state.\n\n`;
