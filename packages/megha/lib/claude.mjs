@@ -14,6 +14,7 @@ import {
   GIT_NETWORK_TIMEOUT_MS, samePath, cloudStateOf, setCloudState, startCloudTurn, stillRunningText, classifyCloud, applyReading, hasEnded, failedText,
 } from "./util.mjs";
 import { diffToolCall, applyLocally, reportApply, diffFiles } from "./diff.mjs";
+import { defaultFor, APPLY_CHOICES } from "./defaults.mjs";
 
 const BASE = (process.env.CLAUDE_CLOUD_BASE_URL || "https://api.anthropic.com").replace(/\/+$/, "");
 const CC_VERSION = "2.1.288";
@@ -248,8 +249,9 @@ export class ClaudeBackend {
   // stopWaitMs: how long a stopped turn (Stop or the limit) is watched for its result after megha
   // sends the interrupt. settleMs: the pause between re-reads in #reconcile right after a watched end.
   // applyGit: the git runner for the local apply (lib/diff.mjs `run`; tests).
-  constructor({ statusPollMs = 15_000, turnTimeoutMs = 3 * 3600_000, idleMs = 120_000, stopWaitMs = 30_000, settleMs = 1000, applyGit = git } = {}) {
-    Object.assign(this, { statusPollMs, turnTimeoutMs, idleMs, stopWaitMs, settleMs, applyGit });
+  // defaults: the --default-* starting values (lib/defaults.mjs), used where a session has no value yet.
+  constructor({ statusPollMs = 15_000, turnTimeoutMs = 3 * 3600_000, idleMs = 120_000, stopWaitMs = 30_000, settleMs = 1000, applyGit = git, defaults = {} } = {}) {
+    Object.assign(this, { statusPollMs, turnTimeoutMs, idleMs, stopWaitMs, settleMs, applyGit, defaults });
   }
 
   checkAuth() { readCredentials(); }
@@ -285,11 +287,17 @@ export class ClaudeBackend {
     session.envs = envs;
     session.models = modelsR.v ?? FALLBACK_MODELS;
     const cfg = session.config ?? (session.config = {});
-    if (!cfg.environment || !envs.some((e) => e.id === cfg.environment)) cfg.environment = pickDefaultEnv(envs)?.id ?? "none";
+    const preferred = (key, choices) => defaultFor(this.defaults, key, choices, { backend: this.label });
+    if (!cfg.environment || !envs.some((e) => e.id === cfg.environment)) {
+      cfg.environment = preferred("environment", envs.map((e) => ({ value: e.id, names: [e.name] }))) ?? pickDefaultEnv(envs)?.id ?? "none";
+    }
     // Records from before megha may hold "default"; T3 never sends that, so use a real id.
-    if (!cfg.model || cfg.model === "default") cfg.model = session.models.some((m) => m.id === DEFAULT_MODEL) ? DEFAULT_MODEL : session.models[0]?.id ?? DEFAULT_MODEL;
-    cfg.mode ??= "acceptEdits";
-    cfg.apply ??= "off";
+    if (!cfg.model || cfg.model === "default") {
+      cfg.model = preferred("model", session.models.map((m) => ({ value: m.id, names: [m.name] })))
+        ?? (session.models.some((m) => m.id === DEFAULT_MODEL) ? DEFAULT_MODEL : session.models[0]?.id ?? DEFAULT_MODEL);
+    }
+    cfg.mode ??= preferred("mode", MODES.map((m) => ({ value: m.value, names: [m.name] }))) ?? "acceptEdits";
+    cfg.apply ??= preferred("apply", APPLY_CHOICES) ?? "off";
     if (!cfg.localChanges) cfg.localChanges = (await localChanges(session.cwd, session.repo)).any ? "on" : "off";
   }
 

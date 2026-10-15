@@ -91,6 +91,21 @@ If you can't run the script, edit the file by hand instead:
 
 If the file doesn't exist or you can't edit it, give the user these values to enter by hand: Settings → Providers → Add provider → Local ACP command. Command: the node path. Arguments, one per row: the megha path, `--backend`, `codex`. Name it Codex Cloud. Then add a second one the same way with `claude` and name it Claude Code on the web.
 
+### Optional: defaults for new threads
+
+Only if the user asks for them. Each provider can choose the values its new threads start with, by adding flags to the end of its `commandArgs`. The user can still change every option per thread in T3.
+
+- `--default-mode`: for Claude one of `default`, `acceptEdits`, `plan`, `bypassPermissions` (without the flag: `acceptEdits`). For Codex one of `code`, `ask`, `plan` (without the flag: `code`).
+- `--default-model`: a model id from the thread's Model option, for example `claude-opus-5-5`.
+- `--default-environment`: an environment id, or its name as the Environment option shows it.
+- `--default-apply`: `on` or `off` (without the flag: `off`).
+
+A value the account doesn't have is ignored: megha falls back to its usual default and the thread still starts. For example:
+
+```json
+"commandArgs": ["<megha path>", "--backend", "claude", "--default-mode", "bypassPermissions", "--default-model", "claude-opus-5-5"]
+```
+
 ## 6. Zed (only if the user asks for it)
 
 Megha speaks ACP, so Zed can start it too. In Zed's settings.json (the user opens it with `zed: open settings`), add this, with the same two paths:
