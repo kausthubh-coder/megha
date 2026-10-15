@@ -6,6 +6,7 @@ import {
   CLAUDE_GITHUB_APP_URL,
   CODEX_CONNECT_URL,
   EXAMPLE_PATHS,
+  INSTALL_COMMAND,
   NODE_PATH_COMMAND,
   NPM_ROOT_COMMAND,
   NPM_URL,
@@ -62,7 +63,8 @@ describe("setup.md", () => {
   test("installs with npm, runs doctor, and stops on Node, install and git failures", () => {
     expect(section(1)).toContain("Node.js 22 or newer");
     expect(section(1)).toContain("stop and tell the user");
-    expect(section(2)).toContain("npm install -g megha");
+    expect(INSTALL_COMMAND).toBe("npm install -g t3-megha");
+    expect(section(2)).toContain(INSTALL_COMMAND);
     expect(section(2)).toContain("stop and show the user the error");
     expect(section(3)).toContain("megha doctor");
     expect(section(3)).toContain("It is a local check");
@@ -105,9 +107,12 @@ describe("setup.md", () => {
     expect(left).toContain("A Claude session started from a bundle can't push a branch");
   });
 
-  test("links the repo and the npm package", () => {
+  test("links the repo and the npm package, which is t3-megha", () => {
     expect(setup).toContain(REPO_URL);
+    expect(NPM_URL).toBe("https://www.npmjs.com/package/t3-megha");
     expect(setup).toContain(NPM_URL);
+    expect(section(4)).toContain("`t3-megha/index.mjs`");
+    expect(setup).not.toMatch(/install -g megha\b/);
   });
 });
 
@@ -120,7 +125,7 @@ describe("config snippets", () => {
       config: {
         source: "local",
         commandPath: "C:\\Program Files\\nodejs\\node.exe",
-        commandArgs: ["C:\\Users\\you\\AppData\\Roaming\\npm\\node_modules\\megha\\index.mjs", "--backend", "codex"],
+        commandArgs: ["C:\\Users\\you\\AppData\\Roaming\\npm\\node_modules\\t3-megha\\index.mjs", "--backend", "codex"],
       },
     });
     expect(parsed.providerInstances["megha-claude"].config.commandArgs[2]).toBe("claude");
@@ -131,7 +136,7 @@ describe("config snippets", () => {
     expect(parsed.agent_servers["Claude Code on the web"]).toEqual({
       type: "custom",
       command: "/opt/homebrew/bin/node",
-      args: ["/opt/homebrew/lib/node_modules/megha/index.mjs", "--backend", "claude"],
+      args: ["/opt/homebrew/lib/node_modules/t3-megha/index.mjs", "--backend", "claude"],
       env: {},
     });
   });

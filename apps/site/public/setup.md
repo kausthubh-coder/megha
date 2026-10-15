@@ -2,7 +2,7 @@
 
 You are a coding agent on the user's computer. The user asked you to set up megha and pointed you at this file. Follow the steps in order. Work in the user's terminal and report back after each step that can fail.
 
-Megha is an open-source ACP agent (https://github.com/kausthubh-coder/megha). T3 Code starts it once per thread, and it runs that thread on Codex Cloud or Claude Code on the web with the codex and claude logins already saved on this computer. The npm package is `megha` (https://www.npmjs.com/package/megha).
+Megha is an open-source ACP agent (https://github.com/kausthubh-coder/megha). T3 Code starts it once per thread, and it runs that thread on Codex Cloud or Claude Code on the web with the codex and claude logins already saved on this computer. The npm package is `t3-megha` (https://www.npmjs.com/package/t3-megha), and the command it installs is `megha`.
 
 ## Rules
 
@@ -18,7 +18,7 @@ Run `node --version`. Megha needs Node.js 22 or newer. If node is missing or old
 
 ## 2. Install megha
 
-Run `npm install -g megha`. Use npm even if bun or another package manager is installed, because step 4 looks in npm's global folder. If the install fails, stop and show the user the error.
+Run `npm install -g t3-megha`. Use npm even if bun or another package manager is installed, because step 4 looks in npm's global folder. If the install fails, stop and show the user the error.
 
 ## 3. Run the local check
 
@@ -30,7 +30,7 @@ Run `megha doctor` and show the user what it prints. It is a local check: it loo
 ## 4. Find the two paths T3 needs
 
 - The node path is the output of `node -p "process.execPath"`. On Windows this is node.exe itself, which T3 needs because it won't start .cmd files.
-- The megha path is the output of `npm root -g`, followed by `megha/index.mjs` (`megha\index.mjs` on Windows).
+- The megha path is the output of `npm root -g`, followed by `t3-megha/index.mjs` (`t3-megha\index.mjs` on Windows).
 
 Then check the megha path by running `node "<megha path>" --version`. It should print a version number. If it doesn't, stop and tell the user, and don't edit any settings.
 

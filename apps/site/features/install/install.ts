@@ -3,7 +3,10 @@
 // checks that it agrees with what this module generates.
 
 export const REPO_URL = "https://github.com/kausthubh-coder/megha";
-export const NPM_URL = "https://www.npmjs.com/package/megha";
+// npm turned down "megha" as too close to "mocha", so the package is t3-megha. Its command is still megha.
+export const NPM_PACKAGE = "t3-megha";
+export const NPM_URL = `https://www.npmjs.com/package/${NPM_PACKAGE}`;
+export const INSTALL_COMMAND = `npm install -g ${NPM_PACKAGE}`;
 
 // Cloud setup the user does in a browser. megha can't do it and `megha doctor` doesn't check it.
 // Codex needs the ChatGPT GitHub connector to see the repo (megha then creates the environment if
@@ -28,26 +31,26 @@ export const BACKENDS: { id: Backend; instanceId: string; displayName: string }[
 
 export type Paths = { node: string; megha: string };
 
-// Typical paths after `npm install -g megha` with Node from the official installer (Windows),
+// Typical paths after `npm install -g t3-megha` with Node from the official installer (Windows),
 // Homebrew (macOS) or the distro package (Linux). Shown as examples next to the commands that
 // print the real ones.
 export const EXAMPLE_PATHS: Record<Os, Paths & { npmRoot: string; settings: string }> = {
   windows: {
     node: "C:\\Program Files\\nodejs\\node.exe",
     npmRoot: "C:\\Users\\you\\AppData\\Roaming\\npm\\node_modules",
-    megha: "C:\\Users\\you\\AppData\\Roaming\\npm\\node_modules\\megha\\index.mjs",
+    megha: "C:\\Users\\you\\AppData\\Roaming\\npm\\node_modules\\t3-megha\\index.mjs",
     settings: "%USERPROFILE%\\.t3\\userdata\\settings.json",
   },
   macos: {
     node: "/opt/homebrew/bin/node",
     npmRoot: "/opt/homebrew/lib/node_modules",
-    megha: "/opt/homebrew/lib/node_modules/megha/index.mjs",
+    megha: "/opt/homebrew/lib/node_modules/t3-megha/index.mjs",
     settings: "~/.t3/userdata/settings.json",
   },
   linux: {
     node: "/usr/bin/node",
     npmRoot: "/usr/lib/node_modules",
-    megha: "/usr/lib/node_modules/megha/index.mjs",
+    megha: "/usr/lib/node_modules/t3-megha/index.mjs",
     settings: "~/.t3/userdata/settings.json",
   },
 };
@@ -64,7 +67,7 @@ export function meghaCheckCommand(meghaPath: string): string {
 
 export function meghaPathFrom(npmRoot: string, os: Os): string {
   const sep = os === "windows" ? "\\" : "/";
-  return [npmRoot.replace(/[\\/]+$/, ""), "megha", "index.mjs"].join(sep);
+  return [npmRoot.replace(/[\\/]+$/, ""), NPM_PACKAGE, "index.mjs"].join(sep);
 }
 
 /** The two entries for the "providerInstances" object in T3 Code's settings.json. */

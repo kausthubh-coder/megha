@@ -7,7 +7,9 @@ import {
   CLAUDE_GITHUB_APP_URL,
   CODEX_CONNECT_URL,
   EXAMPLE_PATHS,
+  INSTALL_COMMAND,
   NODE_PATH_COMMAND,
+  NPM_PACKAGE,
   NPM_ROOT_COMMAND,
   OSES,
   detectOs,
@@ -43,7 +45,7 @@ export function ManualSteps() {
 
   return (
     <div>
-      <div role="tablist" aria-label="Operating system" className="inline-flex gap-1 rounded-md bg-subtle p-1">
+      <div role="tablist" aria-label="Operating system" className="inline-flex gap-1 rounded-full bg-subtle p-1">
         {OSES.map((o, i) => (
           <button
             key={o.id}
@@ -58,8 +60,8 @@ export function ManualSteps() {
             tabIndex={o.id === os ? 0 : -1}
             onClick={() => setChosen(o.id)}
             onKeyDown={(e) => onKeyDown(e, i)}
-            className={`h-11 cursor-pointer rounded-sm px-3.5 text-sm font-medium sm:h-9 ${
-              o.id === os ? "bg-surface text-ink shadow-[0_1px_2px_oklch(0_0_0/0.08)]" : "text-muted hover:text-ink"
+            className={`h-11 cursor-pointer rounded-full px-4 text-sm font-medium sm:h-9 ${
+              o.id === os ? "bg-surface text-ink shadow-[0_1px_2px_oklch(0_0_0/0.12)]" : "text-muted hover:text-ink"
             }`}
           >
             {o.label}
@@ -67,81 +69,73 @@ export function ManualSteps() {
         ))}
       </div>
 
-      <div id="os-panel" role="tabpanel" aria-labelledby={`os-tab-${os}`} className="mt-6">
+      <div id="os-panel" role="tabpanel" aria-labelledby={`os-tab-${os}`} className="mt-8">
         <ol className="grid gap-10">
           <Step n={1} title="Install megha and check your logins">
-            <CodeBlock id={`cmd-install-${os}`} label="Terminal" copyName="install commands" code={"npm install -g megha\nmegha doctor"} />
-            <p className="mt-3 max-w-[50ch] text-sm text-muted">
-              Use npm, even if you have bun: the next step finds megha in npm&apos;s global folder.{" "}
-              <code className="font-mono text-xs text-ink">megha doctor</code> checks Node, git and your logins on this
-              computer only. A missing login matters only for the cloud you use.
+            <CodeBlock id={`cmd-install-${os}`} label="Terminal" copyName="install commands" code={`${INSTALL_COMMAND}\nmegha doctor`} />
+            <p className="mt-3 max-w-[52ch] text-sm text-muted">
+              The package is <code className="font-mono text-xs text-ink">{NPM_PACKAGE}</code>; the command is{" "}
+              <code className="font-mono text-xs text-ink">megha</code>. Use npm even if you have bun, because the next step
+              looks in npm&apos;s global folder. The doctor checks Node, git and your logins on this computer only.
             </p>
           </Step>
 
           <Step n={2} title="Find the two paths T3 needs">
             <CodeBlock id={`cmd-paths-${os}`} label="Terminal" copyName="path commands" code={`${NODE_PATH_COMMAND}\n${NPM_ROOT_COMMAND}`} />
-            <dl className="mt-3 grid gap-x-4 gap-y-1 text-sm sm:grid-cols-[auto_1fr]">
-              <dt className="text-muted">Node path, for example</dt>
-              <dd className="min-w-0 font-mono text-xs leading-6 wrap-anywhere">{paths.node}</dd>
-              <dt className="text-muted">Megha path, for example</dt>
-              <dd className="min-w-0 font-mono text-xs leading-6 wrap-anywhere">{paths.megha}</dd>
-            </dl>
-            <p className="mt-3 max-w-[50ch] text-sm text-muted">
-              The megha path is the second command&apos;s output followed by{" "}
-              <code className="font-mono text-xs text-ink">{os === "windows" ? "\\megha\\index.mjs" : "/megha/index.mjs"}</code>.
-              {os === "windows" ? " Point T3 at node.exe itself, because T3 won't start .cmd files." : ""}
+            <p className="mt-3 max-w-[52ch] text-sm text-muted">
+              The first prints the node path. The megha path is the second one&apos;s output followed by{" "}
+              <code className="font-mono text-xs text-ink">{os === "windows" ? `\\${NPM_PACKAGE}\\index.mjs` : `/${NPM_PACKAGE}/index.mjs`}</code>, for
+              example <code className="font-mono text-xs wrap-anywhere text-ink">{paths.megha}</code>. Check it prints a version:
             </p>
-            <p className="mt-3 mb-3 max-w-[50ch] text-sm text-muted">
-              Check the megha path before you save it anywhere. This prints megha&apos;s version; if it fails, the path is
-              wrong.
-            </p>
-            <CodeBlock id={`cmd-check-${os}`} label="Terminal" copyName="path check" code={meghaCheckCommand(paths.megha)} />
+            <div className="mt-3">
+              <CodeBlock id={`cmd-check-${os}`} label="Terminal" copyName="path check" code={meghaCheckCommand(paths.megha)} />
+            </div>
           </Step>
 
           <Step n={3} title="Add two providers in T3 Code">
-            <p className="max-w-[50ch] text-sm">
-              Settings → Providers → Add provider → <strong className="font-semibold">Local ACP command</strong>. Command: the node
-              path. Arguments, one per row: the megha path, <code className="font-mono text-xs">--backend</code>,{" "}
-              <code className="font-mono text-xs">codex</code>. Name it Codex Cloud. Then add a second one with{" "}
-              <code className="font-mono text-xs">claude</code> and name it Claude Code on the web.
+            <p className="max-w-[52ch] text-sm text-muted">
+              In <code className="font-mono text-xs wrap-anywhere text-ink">{paths.settings}</code>, with your paths. T3 picks up
+              the change while it runs. Or use Settings → Providers → Add provider → Local ACP command, with the same values.
             </p>
-            <p className="mt-3 mb-3 max-w-[50ch] text-sm text-muted">
-              Or add the same thing to <code className="font-mono text-xs wrap-anywhere text-ink">{paths.settings}</code>, with
-              your paths. T3 picks up the change while it runs.
-            </p>
-            <CodeBlock id={`t3-settings-${os}`} label="T3 Code settings.json" code={t3SettingsSnippet(paths)} />
+            <div className="mt-3">
+              <CodeBlock id={`t3-settings-${os}`} label="T3 Code settings.json" code={t3SettingsSnippet(paths)} />
+            </div>
+            <details className="group mt-4 text-sm">
+              <summary className="inline-flex h-11 cursor-pointer items-center gap-2 font-medium text-ink sm:h-9 [&::-webkit-details-marker]:hidden">
+                <svg viewBox="0 0 16 16" className="size-3.5 text-muted group-open:rotate-90" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden>
+                  <path d="M6 3.5L10.5 8 6 12.5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                Using Zed instead?
+              </summary>
+              <p className="mt-2 mb-3 max-w-[52ch] text-muted">
+                Megha speaks ACP, so Zed can start it too. Run <code className="font-mono text-xs text-ink">zed: open settings</code>{" "}
+                and add:
+              </p>
+              <CodeBlock id={`zed-settings-${os}`} label="Zed settings.json" code={zedSettingsSnippet(paths)} />
+            </details>
           </Step>
 
           <Step n={4} title="Connect each cloud to your repo">
-            <ul className="grid max-w-[50ch] gap-2 text-sm">
+            <ul className="grid max-w-[52ch] gap-2 text-sm text-muted">
               <li>
-                <strong className="font-semibold">Codex Cloud:</strong>{" "}
-                <a href={CODEX_CONNECT_URL} className={link}>
+                <strong className="font-semibold text-ink">Codex Cloud:</strong>{" "}
+                <a href={CODEX_CONNECT_URL} className={`text-ink ${link}`}>
                   connect GitHub to Codex
                 </a>{" "}
-                and give it access to the repo. Megha creates the environment on your first prompt if there isn&apos;t
-                one.
+                and give it the repo. Megha creates the environment on your first prompt.
               </li>
               <li>
-                <strong className="font-semibold">Claude Code on the web:</strong> open{" "}
-                <a href={CLAUDE_CODE_URL} className={link}>
+                <strong className="font-semibold text-ink">Claude Code on the web:</strong> open{" "}
+                <a href={CLAUDE_CODE_URL} className={`text-ink ${link}`}>
                   claude.ai/code
                 </a>{" "}
-                once to create your cloud environment. Install the{" "}
-                <a href={CLAUDE_GITHUB_APP_URL} className={link}>
+                once. To get Claude&apos;s changes back, install the{" "}
+                <a href={CLAUDE_GITHUB_APP_URL} className={`text-ink ${link}`}>
                   Claude GitHub App
                 </a>{" "}
-                on the repo if you want Claude to push its branch back for you to apply.
+                on the repo.
               </li>
             </ul>
-          </Step>
-
-          <Step n={5} title="Or use it from Zed">
-            <p className="mb-3 max-w-[50ch] text-sm text-muted">
-              Megha speaks ACP, so any ACP client can start it. In Zed, run{" "}
-              <code className="font-mono text-xs text-ink">zed: open settings</code> and add:
-            </p>
-            <CodeBlock id={`zed-settings-${os}`} label="Zed settings.json" code={zedSettingsSnippet(paths)} />
           </Step>
         </ol>
       </div>
