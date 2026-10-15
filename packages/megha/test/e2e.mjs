@@ -45,7 +45,8 @@ try {
   await agent.request("initialize", T3_INITIALIZE);
   const s = await agent.request("session/new", { cwd, mcpServers: [] });
   if (backend === "codex") {
-    await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "environment", value: "<your-codex-env-id>" });
+    // MEGHA_E2E_CODEX_ENV picks the environment; otherwise megha's default for this repo is used.
+    if (process.env.MEGHA_E2E_CODEX_ENV) await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "environment", value: process.env.MEGHA_E2E_CODEX_ENV });
     await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "mode", value: "ask" });
   }
   const opts = (await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "apply", value: "off" })).configOptions;
