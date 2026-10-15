@@ -1,0 +1,6 @@
+[
+  { "method": "initialize", "params": { "protocolVersion": 2, "info": { "name": "t3-code", "version": "0.0.46-nightly" }, "capabilities": {}, "clientCapabilities": { "fs": { "readTextFile": false, "writeTextFile": false }, "terminal": false }, "clientInfo": { "name": "t3-code", "version": "0.0.46-nightly" } } },
+  { "method": "session/load", "params": { "sessionId": "$loadId", "cwd": "$cwd", "mcpServers": [] }, "timeoutMs": 120000 },
+  { "method": "session/prompt", "params": { "sessionId": "$sessionId", "prompt": [{ "type": "text", "text": "/status" }] }, "timeoutMs": 60000 },
+  { "method": "session/prompt", "params": { "sessionId": "$sessionId", "prompt": [{ "type": "text", "text": "/open" }] }, "timeoutMs": 60000 }
+]

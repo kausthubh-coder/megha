@@ -40,11 +40,13 @@ site, bun for development.
 
 ## Start and ship
 
-- Every task in a new worktree starts with the `worktree-megha` skill. Never two agents in one checkout.
-- Ship only with the `ship-megha` skill, and only when I say ship, deploy or release.
+- Every task in a new worktree starts with the `worktree-megha` skill (`.agents/skills/worktree-megha/SKILL.md`; it also covers removing a worktree). Never two agents in one checkout.
+- Ship only with the `ship-megha` skill (`.agents/skills/ship-megha/SKILL.md`), and only when I say ship, deploy or release.
+- CI (`.github/workflows/ci.yml`) runs `bun install --frozen-lockfile` and `bun run check` on ubuntu, macos and windows for every PR.
 
 ## Proving a change works
 
+- Prove changes with the `verify-megha` skill (`.agents/skills/verify-megha/SKILL.md`): ACP drives, real T3 threads, and the site in Chrome.
 - Done means you saw it work. For the agent: run it the way T3 does (`node packages/megha/index.mjs --backend codex|claude`, cwd = a real GitHub repo) and read the session/update stream. For the site: open it in a browser.
 - Live cloud tasks cost the user's quota. Use read-only smoke tests by default; create a cloud task only when the change needs one, with a read-only prompt.
 - A skipped check is not a pass. Report what you ran, what you saw, and what you did not check.
