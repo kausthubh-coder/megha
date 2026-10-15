@@ -1,0 +1,16 @@
+{
+  "name": "megha-monorepo",
+  "private": true,
+  "workspaces": ["packages/*", "apps/*"],
+  "packageManager": "bun@1.3.14",
+  "scripts": {
+    "test": "bun run --filter megha test",
+    "lint": "bun run --filter site lint",
+    "typecheck": "bun run --filter site typecheck",
+    "build": "bun run --filter site build",
+    "dev": "bun run --filter site dev",
+    "check": "bun run test && bun run lint && bun run typecheck && bun run build",
+    "doctor": "node scripts/doctor.mjs",
+    "setup": "node scripts/setup.mjs"
+  }
+}

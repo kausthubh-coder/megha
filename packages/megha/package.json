@@ -1,0 +1,40 @@
+{
+  "name": "megha",
+  "version": "0.1.0",
+  "description": "Run T3 Code (or any ACP client) threads on Codex Cloud and Claude Code on the web, using your existing logins.",
+  "type": "module",
+  "bin": {
+    "megha": "index.mjs"
+  },
+  "main": "index.mjs",
+  "files": [
+    "index.mjs",
+    "lib/",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "acp",
+    "agent-client-protocol",
+    "t3code",
+    "codex",
+    "claude-code",
+    "cloud"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kausthubh-coder/megha.git",
+    "directory": "packages/megha"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node test/offline.mjs",
+    "smoke": "node test/smoke.mjs"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.8.0"
+  }
+}
