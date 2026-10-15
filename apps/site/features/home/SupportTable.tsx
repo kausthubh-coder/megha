@@ -1,12 +1,29 @@
 const ROWS: { works: boolean; feature: string; note: string }[] = [
   { works: true, feature: "Streaming progress", note: "Setup log, commands and the answer show up while the cloud task runs." },
   { works: true, feature: "Follow-ups", note: "The next message in the thread continues the same cloud task." },
-  { works: true, feature: "Stop", note: "T3's stop button stops the cloud task." },
+  {
+    works: true,
+    feature: "Stop",
+    note: "T3's stop button asks the cloud to cancel and gives you the thread back at once. The cloud can take a moment to stop; if you're not sure it did, check the task on chatgpt.com or claude.ai.",
+  },
   { works: true, feature: "Model picker", note: "Both list the cloud's live models. Claude runs the one you pick; Codex Cloud may still run its default." },
   { works: true, feature: "Environments", note: "Pick the cloud environment for each thread in the composer." },
   { works: true, feature: "Import cloud tasks", note: "List sessions → Import brings a task you started on the web into T3." },
-  { works: true, feature: "Apply diff locally", note: "Turn it on and the cloud's changes are applied to your checkout." },
-  { works: false, feature: "T3's diff panel", note: "Only after you apply the diff locally. Otherwise the diff shows in the thread." },
+  {
+    works: true,
+    feature: "Apply diff locally: Codex",
+    note: "Turn it on and megha applies each turn's diff to your checkout. If git can't apply it, megha saves it as a patch file instead.",
+  },
+  {
+    works: true,
+    feature: "Apply diff locally: Claude",
+    note: "Only when the session pushes its claude/ branch, which needs the Claude GitHub App on the repo. A session started from a git bundle can't push, so its changes stay on claude.ai.",
+  },
+  {
+    works: false,
+    feature: "T3's diff panel",
+    note: "Only after megha applies a diff to your checkout. Until then, a Codex diff or a pushed Claude branch shows in the thread.",
+  },
   { works: false, feature: "Terminal and previews", note: "You can't open a shell or a preview on the cloud machine." },
   { works: false, feature: "T3 tools in the cloud", note: "The cloud agent can't call T3's own tools." },
 ];

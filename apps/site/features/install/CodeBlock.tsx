@@ -1,4 +1,5 @@
 import { CopyButton } from "./CopyButton";
+import { CopyFallbackHint } from "./CopyFallback";
 
 /** A labelled block of code or commands with its own copy button. */
 export function CodeBlock({
@@ -21,6 +22,7 @@ export function CodeBlock({
         <span className="truncate text-xs text-muted">{label}</span>
         <CopyButton text={code} label="Copy" srContext={copyName} variant="quiet" fallbackTargetId={id} />
       </div>
+      <CopyFallbackHint targetId={id} what="text" />
       <pre
         id={id}
         tabIndex={0}

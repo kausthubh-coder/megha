@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
+  CLAUDE_CODE_URL,
+  CLAUDE_GITHUB_APP_URL,
+  CODEX_CONNECT_URL,
   EXAMPLE_PATHS,
   buildInstallPrompt,
   detectOs,
@@ -34,9 +37,32 @@ describe("install prompt", () => {
     expect(prompt).toContain("Settings → Providers → Add provider → Local ACP command");
   });
 
-  test("tells the agent to leave logins and credentials alone", () => {
+  test("tells the agent to leave logins and credentials alone, and to back up T3's settings", () => {
     expect(prompt).toContain("Don't run the logins yourself");
     expect(prompt).toContain("don't open or print any token or credential files");
+    expect(prompt).toContain("Make a backup copy");
+  });
+
+  test("stops on Node, install and git failures, but not on a login for an unused cloud", () => {
+    expect(prompt).toContain("If it's missing or older, stop");
+    expect(prompt).toContain("If it fails, stop and show me the error");
+    expect(prompt).toContain("If node or git fails, stop");
+    expect(prompt).toContain("A missing login only matters for a cloud I'll use");
+  });
+
+  test("checks the megha path runs before any settings are edited", () => {
+    const check = prompt.indexOf('node "<megha path>" --version');
+    expect(check).toBeGreaterThan(-1);
+    expect(check).toBeLessThan(prompt.indexOf("Make a backup copy"));
+  });
+
+  test("says doctor is local and hands the browser setup for each cloud to the user", () => {
+    expect(prompt).toContain("It is a local check");
+    expect(prompt).toContain("what I still have to do myself in a browser");
+    expect(prompt).toContain(CODEX_CONNECT_URL);
+    expect(prompt).toContain(`open ${CLAUDE_CODE_URL} once`);
+    expect(prompt).toContain(`Claude GitHub App (${CLAUDE_GITHUB_APP_URL})`);
+    expect(prompt).toContain("A Claude session started from a bundle can't push a branch");
   });
 });
 

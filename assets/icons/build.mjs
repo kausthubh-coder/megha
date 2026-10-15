@@ -166,6 +166,10 @@ if (process.argv.includes("--sheet")) {
     .composite([...bgs, ...composites])
     .png()
     .toBuffer();
-  await writeFile(path.join(root, "apps/site/screenshots/icons-sheet.png"), sheet);
+  // apps/site/screenshots/ is gitignored, so a fresh checkout doesn't have it yet.
+  const sheetDir = path.join(root, "apps/site/screenshots");
+  await mkdir(sheetDir, { recursive: true });
+  await writeFile(path.join(sheetDir, "icons-sheet.png"), sheet);
+  console.log(`wrote ${path.relative(root, path.join(sheetDir, "icons-sheet.png"))}`);
 }
 console.log(`wrote ${rows.length} icons x ${SIZES.length} sizes, favicon.ico, icon.svg, apple-icon.png`);

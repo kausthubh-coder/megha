@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { showCopyFallback } from "./CopyFallback";
 
-type State = "idle" | "copied" | "failed";
+// handedOff: the clipboard is blocked and the copied block now shows how to copy by hand.
+type State = "idle" | "copied" | "handedOff" | "failed";
 
 const RESET_MS = 2000;
 
@@ -39,23 +41,19 @@ export function CopyButton({
     try {
       await navigator.clipboard.writeText(text);
     } catch {
-      const target = fallbackTargetId ? document.getElementById(fallbackTargetId) : null;
-      if (target) {
-        window.getSelection()?.selectAllChildren(target);
-        // The hero's prompt lives further down the page; bring the selection to where the person can see it.
-        target.scrollIntoView({ block: "nearest" });
-      }
-      next = "failed";
+      // The block being copied shows the instructions, selects its text and takes focus.
+      next = fallbackTargetId && showCopyFallback(fallbackTargetId) ? "handedOff" : "failed";
     }
     setState(next);
     // A failure needs longer: the person has to read the label and press the keys.
-    timer.current = setTimeout(() => setState("idle"), next === "failed" ? RESET_MS * 2 : RESET_MS);
+    timer.current = setTimeout(() => setState("idle"), next === "copied" ? RESET_MS : RESET_MS * 2);
   }
 
   const labels: Record<State, string> = {
     idle: label,
     copied: "Copied",
-    failed: fallbackTargetId ? "Text selected" : "Copy blocked",
+    handedOff: "Text selected",
+    failed: "Copy blocked",
   };
 
   const base =
@@ -83,14 +81,9 @@ export function CopyButton({
           </span>
         ))}
       </button>
+      {/* handedOff says nothing here: focus moves to the visible instructions, which get read out. */}
       <span className="sr-only" aria-live="polite">
-        {state === "copied"
-          ? "Copied to clipboard"
-          : state === "failed"
-            ? fallbackTargetId
-              ? "The clipboard is blocked. The text is selected; press Control C or Command C to copy it."
-              : "The clipboard is blocked."
-            : ""}
+        {state === "copied" ? "Copied to clipboard" : state === "failed" ? "The clipboard is blocked." : ""}
       </span>
     </>
   );

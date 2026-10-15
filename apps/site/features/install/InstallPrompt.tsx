@@ -1,4 +1,5 @@
 import { CopyButton } from "./CopyButton";
+import { CopyFallbackHint } from "./CopyFallback";
 
 /** The install prompt, shown in full so people can read what they paste. */
 export function CodeBlockPrompt({ id, prompt }: { id: string; prompt: string }) {
@@ -8,6 +9,7 @@ export function CodeBlockPrompt({ id, prompt }: { id: string; prompt: string }) 
         <span className="text-sm text-muted">Install prompt</span>
         <CopyButton text={prompt} label="Copy prompt" fallbackTargetId={id} />
       </div>
+      <CopyFallbackHint targetId={id} what="prompt" />
       <pre
         id={id}
         tabIndex={0}

@@ -3,7 +3,14 @@ import { MeghaMark } from "@/features/brand/MeghaMark";
 import { CodeBlockPrompt } from "@/features/install/InstallPrompt";
 import { CopyButton } from "@/features/install/CopyButton";
 import { ManualSteps } from "@/features/install/ManualSteps";
-import { NPM_URL, REPO_URL, buildInstallPrompt } from "@/features/install/install";
+import {
+  CLAUDE_CODE_URL,
+  CLAUDE_GITHUB_APP_URL,
+  CODEX_CONNECT_URL,
+  NPM_URL,
+  REPO_URL,
+  buildInstallPrompt,
+} from "@/features/install/install";
 import { ThreadMock } from "@/features/thread-mock/ThreadMock";
 import { SupportTable } from "./SupportTable";
 
@@ -61,8 +68,9 @@ export function HomePage() {
               Install with one prompt
             </h2>
             <p className="mt-4 max-w-[50ch] text-muted">
-              Paste this into Claude Code, Codex or a T3 thread on your computer. The agent installs megha from npm, checks
-              your logins, and adds two providers to T3 Code: Codex Cloud and Claude Code on the web.
+              Paste this into Claude Code, Codex or a T3 thread on your computer. The agent installs megha from npm, runs
+              its local check, and adds two providers to T3 Code: Codex Cloud and Claude Code on the web. Then it lists
+              the browser steps that are left for you.
             </p>
             <div className="mt-8">
               <CodeBlockPrompt id="install-prompt" prompt={prompt} />
@@ -81,18 +89,35 @@ export function HomePage() {
             </h2>
             <ul className="mt-8 grid gap-6 sm:grid-cols-2">
               <Need title="Codex Cloud">
-                A ChatGPT account with Codex, signed in on this computer with{" "}
-                <code className="font-mono text-sm">codex login</code>.
+                A ChatGPT plan with Codex, signed in on this computer with{" "}
+                <code className="font-mono text-sm">codex login</code>. Then{" "}
+                <a href={CODEX_CONNECT_URL} className={link}>
+                  connect GitHub to Codex
+                </a>{" "}
+                and give it access to your repo. Megha creates the repo&apos;s environment on your first prompt if it
+                has none.
               </Need>
               <Need title="Claude Code on the web">
                 A Claude subscription, signed in by running <code className="font-mono text-sm">claude</code>, then{" "}
-                <code className="font-mono text-sm">/login</code>.
+                <code className="font-mono text-sm">/login</code>. Open{" "}
+                <a href={CLAUDE_CODE_URL} className={link}>
+                  claude.ai/code
+                </a>{" "}
+                once to create your cloud environment. To get Claude&apos;s changes back here, install the{" "}
+                <a href={CLAUDE_GITHUB_APP_URL} className={link}>
+                  Claude GitHub App
+                </a>{" "}
+                on the repo.
               </Need>
-              <Need title="A repo on GitHub">
-                The cloud clones your repo from GitHub, not from your disk. Push your branch before you start a thread.
+              <Need title="Your branch on GitHub">
+                Both clouds start from what&apos;s pushed. With &quot;Send local changes&quot; on, megha sends unpushed
+                work instead: a patch for Codex, a git bundle for Claude. A Claude session started from a bundle
+                can&apos;t push back, so its changes stay on claude.ai.
               </Need>
               <Need title="Node.js 22 or newer">
-                T3 Code starts megha with node, once per thread. You only need the CLI for the cloud you use.
+                T3 Code starts megha with node, once per thread. <code className="font-mono text-sm">megha doctor</code>{" "}
+                checks Node, git and both logins on this computer, not the cloud setup. You only need the login for the
+                cloud you use.
               </Need>
             </ul>
           </div>

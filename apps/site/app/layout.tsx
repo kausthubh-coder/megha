@@ -5,10 +5,22 @@ import "./globals.css";
 const instrument = Instrument_Sans({ variable: "--font-instrument", subsets: ["latin"] });
 const jetbrains = JetBrains_Mono({ variable: "--font-jetbrains", subsets: ["latin"] });
 
+const title = "megha: run T3 Code threads on Codex Cloud and Claude Code on the web";
+const description =
+  "An open-source ACP agent that runs T3 Code and Zed threads on Codex Cloud and Claude Code on the web, using your existing codex and claude logins.";
+
+// The production URL isn't decided yet. Set NEXT_PUBLIC_SITE_URL in Vercel once it is; canonical and
+// og:image URLs are built from it.
+const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "https://megha.vercel.app";
+
+// og:image and twitter:image come from app/opengraph-image.tsx.
 export const metadata: Metadata = {
-  title: "megha: run T3 Code threads on Codex Cloud and Claude Code on the web",
-  description:
-    "An open-source ACP agent that runs T3 Code and Zed threads on Codex Cloud and Claude Code on the web, using your existing codex and claude logins.",
+  metadataBase: new URL(siteUrl),
+  title,
+  description,
+  alternates: { canonical: "/" },
+  openGraph: { type: "website", url: "/", siteName: "megha", title, description, locale: "en_US" },
+  twitter: { card: "summary_large_image", title, description },
 };
 
 export const viewport: Viewport = {

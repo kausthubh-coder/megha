@@ -3,15 +3,21 @@
 import { useRef, useState, useSyncExternalStore } from "react";
 import { CodeBlock } from "./CodeBlock";
 import {
+  CLAUDE_CODE_URL,
+  CLAUDE_GITHUB_APP_URL,
+  CODEX_CONNECT_URL,
   EXAMPLE_PATHS,
   NODE_PATH_COMMAND,
   NPM_ROOT_COMMAND,
   OSES,
   detectOs,
+  meghaCheckCommand,
   t3SettingsSnippet,
   zedSettingsSnippet,
   type Os,
 } from "./install";
+
+const link = "underline decoration-border underline-offset-4 hover:decoration-current";
 
 // The visitor's OS picks the default tab. The server render (and the static shell) shows Windows,
 // then the client switches once; every tab has the same structure, so only the paths change.
@@ -66,8 +72,9 @@ export function ManualSteps() {
           <Step n={1} title="Install megha and check your logins">
             <CodeBlock id={`cmd-install-${os}`} label="Terminal" copyName="install commands" code={"npm install -g megha\nmegha doctor"} />
             <p className="mt-3 max-w-[50ch] text-sm text-muted">
-              Using bun? <code className="font-mono text-xs text-ink">bun add -g megha</code> works too; the file is then
-              under <code className="font-mono text-xs wrap-anywhere text-ink">~/.bun/install/global/node_modules/megha</code>.
+              Use npm, even if you have bun: the next step finds megha in npm&apos;s global folder.{" "}
+              <code className="font-mono text-xs text-ink">megha doctor</code> checks Node, git and your logins on this
+              computer only. A missing login matters only for the cloud you use.
             </p>
           </Step>
 
@@ -84,6 +91,11 @@ export function ManualSteps() {
               <code className="font-mono text-xs text-ink">{os === "windows" ? "\\megha\\index.mjs" : "/megha/index.mjs"}</code>.
               {os === "windows" ? " Point T3 at node.exe itself, because T3 won't start .cmd files." : ""}
             </p>
+            <p className="mt-3 mb-3 max-w-[50ch] text-sm text-muted">
+              Check the megha path before you save it anywhere. This prints megha&apos;s version; if it fails, the path is
+              wrong.
+            </p>
+            <CodeBlock id={`cmd-check-${os}`} label="Terminal" copyName="path check" code={meghaCheckCommand(paths.megha)} />
           </Step>
 
           <Step n={3} title="Add two providers in T3 Code">
@@ -100,7 +112,31 @@ export function ManualSteps() {
             <CodeBlock id={`t3-settings-${os}`} label="T3 Code settings.json" code={t3SettingsSnippet(paths)} />
           </Step>
 
-          <Step n={4} title="Or use it from Zed">
+          <Step n={4} title="Connect each cloud to your repo">
+            <ul className="grid max-w-[50ch] gap-2 text-sm">
+              <li>
+                <strong className="font-semibold">Codex Cloud:</strong>{" "}
+                <a href={CODEX_CONNECT_URL} className={link}>
+                  connect GitHub to Codex
+                </a>{" "}
+                and give it access to the repo. Megha creates the environment on your first prompt if there isn&apos;t
+                one.
+              </li>
+              <li>
+                <strong className="font-semibold">Claude Code on the web:</strong> open{" "}
+                <a href={CLAUDE_CODE_URL} className={link}>
+                  claude.ai/code
+                </a>{" "}
+                once to create your cloud environment. Install the{" "}
+                <a href={CLAUDE_GITHUB_APP_URL} className={link}>
+                  Claude GitHub App
+                </a>{" "}
+                on the repo if you want Claude to push its branch back for you to apply.
+              </li>
+            </ul>
+          </Step>
+
+          <Step n={5} title="Or use it from Zed">
             <p className="mb-3 max-w-[50ch] text-sm text-muted">
               Megha speaks ACP, so any ACP client can start it. In Zed, run{" "}
               <code className="font-mono text-xs text-ink">zed: open settings</code> and add:
